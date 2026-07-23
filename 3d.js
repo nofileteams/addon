@@ -250,6 +250,15 @@
             }
           },
           {
+            opcode: 'setColor',
+            blockType: Scratch.BlockType.COMMAND,
+            text: 'オブジェクト[NAME]の色を[COLOR]に設定する',
+            arguments: {
+              NAME: { type: Scratch.ArgumentType.STRING, defaultValue: 'obj1' },
+              COLOR: { type: Scratch.ArgumentType.COLOR }
+            }
+          },
+          {
             opcode: 'setModelFromList',
             blockType: Scratch.BlockType.COMMAND,
             text: 'オブジェクト[NAME]のモデルを[DATA]に設定する',
@@ -719,6 +728,23 @@
       } catch (e) {
         console.warn('[3D] テクスチャ(URL)の読み込みに失敗:', e);
       }
+    }
+
+    setColor(args) {
+      const obj = manager.get(String(args.NAME));
+      if (!obj) return;
+      const color = new THREE.Color(String(args.COLOR));
+      obj.mesh.traverse((child) => {
+        if (child.material) {
+          const mats = Array.isArray(child.material) ? child.material : [child.material];
+          mats.forEach((mat) => {
+            if (mat.color) {
+              mat.color.copy(color);
+              mat.needsUpdate = true;
+            }
+          });
+        }
+      });
     }
 
     async setModelFromList(args) {

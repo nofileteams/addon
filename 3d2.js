@@ -26,6 +26,8 @@
   glRenderer.setSize(480, 360, false);
   glRenderer.outputColorSpace = THREE.SRGBColorSpace;
   glRenderer.shadowMap.enabled = true;
+  glRenderer.setClearColor(0x000000, 0);
+  glRenderer.autoClear = true;
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(60, 4/3, 0.1, 10000);
@@ -74,18 +76,29 @@
     }
   }
 
+  function clearSkin() {
+    glRenderer.setRenderTarget(null);
+    glRenderer.clear();
+    const skin = renderer._allSkins[skinId];
+    if (skin) skin.update();
+    runtime.requestRedraw();
+  }
   function installBackLayer() {
-    if (renderer._layerGroups.backlayer3d) return;
-    const videoIndex = Math.max(0, renderer._groupOrdering.indexOf("video"));
-    renderer._groupOrdering.splice(videoIndex + 1, 0, "backlayer3d");
-    renderer._layerGroups.backlayer3d = {groupIndex:0, drawListOffset:renderer._layerGroups.video.drawListOffset};
-    renderer._groupOrdering.forEach((name, index) => renderer._layerGroups[name].groupIndex = index);
-    skinId = renderer._nextSkinId++;
-    const skin = new CanvasSkin(skinId);
-    renderer._allSkins[skinId] = skin;
-    drawableId = renderer.createDrawable("backlayer3d");
-    renderer.updateDrawableSkinId(drawableId, skinId);
-    if (renderer.markDrawableAsNoninteractive) renderer.markDrawableAsNoninteractive(drawableId);
+    if (!renderer._layerGroups.backlayer3d) {
+      const videoIndex = Math.max(0, renderer._groupOrdering.indexOf("video"));
+      renderer._groupOrdering.splice(videoIndex + 1, 0, "backlayer3d");
+      renderer._layerGroups.backlayer3d = {groupIndex:0, drawListOffset:renderer._layerGroups.video.drawListOffset};
+      renderer._groupOrdering.forEach((n, index) => renderer._layerGroups[n].groupIndex = index);
+    }
+    if (!renderer._allSkins[skinId] || !renderer._allDrawables[drawableId]) {
+      skinId = renderer._nextSkinId++;
+      const skin = new CanvasSkin(skinId);
+      renderer._allSkins[skinId] = skin;
+      drawableId = renderer.createDrawable("backlayer3d");
+      renderer.updateDrawableSkinId(drawableId, skinId);
+      if (renderer.markDrawableAsNoninteractive) renderer.markDrawableAsNoninteractive(drawableId);
+    }
+    clearSkin();
   }
   installBackLayer();
 
@@ -231,7 +244,8 @@
         {opcode:"getRotationZ", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の z の向き", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getScaleX", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の x の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getScaleY", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の y の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
-        {opcode:"getScaleZ", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の z の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}}
+        {opcode:"getScaleZ", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の z の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
+        {opcode:"distance", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] からオブジェクト [TARGET] までの距離", arguments:{NAME:{type:S,defaultValue:"box"},TARGET:{type:S,defaultValue:"target"}}}
       ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff}};
     }
 
@@ -271,7 +285,7 @@
     isTouching(a){return touching(object(a.NAME),object(a.TARGET));}
     bounce(a){const o=object(a.NAME);if(!o||o.userData.passThrough)return;for(const other of objects.values()){if(other!==o&&touching(o,other)){const delta=o.position.clone().sub(other.position);if(Math.abs(delta.x)>=Math.abs(delta.y)&&Math.abs(delta.x)>=Math.abs(delta.z))o.position.x+=Math.sign(delta.x||1)*0.2;else if(Math.abs(delta.y)>=Math.abs(delta.z))o.position.y+=Math.sign(delta.y||1)*0.2;else o.position.z+=Math.sign(delta.z||1)*0.2;break;}}}
     start(){drawing=true;}
-    stop(){drawing=false;glRenderer.clear();const skin=renderer._allSkins[skinId];if(skin)skin.update();runtime.requestRedraw();}
+    stop(){drawing=false;clearSkin();}
     isDrawing(){return drawing;}
     setFogDistance(a){fogDistance=num(a.VALUE);updateFog();}
     setFogColor(a){fogColor=color(a.COLOR);updateFog();}
@@ -289,13 +303,15 @@
     getScaleX(a){const o=object(a.NAME);return o?o.scale.x*100:0;}
     getScaleY(a){const o=object(a.NAME);return o?o.scale.y*100:0;}
     getScaleZ(a){const o=object(a.NAME);return o?o.scale.z*100:0;}
+    distance(a){const o=object(a.NAME),t=object(a.TARGET);return o&&t?o.position.distanceTo(t.position):0;}
 
     async textureCostume(a,util){const o=object(a.NAME);if(!o)return;const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.needsUpdate=true;});}
     async textureURL(a){const o=object(a.NAME);if(!o)return;const url=name(a.URL);if(!await Scratch.canFetch(url))return;const response=await Scratch.fetch(url);const blob=await response.blob();const local=URL.createObjectURL(blob);try{const texture=await new THREE.TextureLoader().loadAsync(local);texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.needsUpdate=true;});}finally{URL.revokeObjectURL(local);}}
     async modelList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;let root;if(items.every(v=>Number.isFinite(Number(v))&&Number(v)>=0&&Number(v)<=255)){const bytes=new Uint8Array(items.map(Number));const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(bytes.buffer,"",resolve,reject));root=gltf.scene;}else{const text=items.join("\n").trim();if(text.startsWith("{")||text.startsWith("[")){const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(text,"",resolve,reject));root=gltf.scene;}else root=new OBJLoader().parse(text);}replaceObject(n,root);}
   }
 
-  runtime.on("PROJECT_STOP_ALL",()=>{drawing=false;});
+  runtime.on("PROJECT_STOP_ALL",()=>{drawing=false;clearSkin();});
+  runtime.on("PROJECT_LOADED",()=>{drawing=false;installBackLayer();});
   runtime.on("RUNTIME_DISPOSED",()=>{cancelAnimationFrame(frame);glRenderer.dispose();});
   Scratch.extensions.register(new BackLayer3D());
 })(Scratch);

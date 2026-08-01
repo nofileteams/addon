@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: Base44
 // License: MIT
-// Version: 1.1.0
+// Version: 1.2.0
 
 (async function (Scratch) {
   "use strict";
@@ -27,6 +27,8 @@
   glRenderer.setSize(480, 360, false);
   glRenderer.outputColorSpace = THREE.SRGBColorSpace;
   glRenderer.shadowMap.enabled = true;
+  // [ADD] RTX 高度な影: デフォルトは基本品質(off)。on で PCFSoftShadowMap に切り替え
+  glRenderer.shadowMap.type = THREE.PCFShadowMap;
   glRenderer.setClearColor(0x000000, 0);
   glRenderer.autoClear = true;
 
@@ -60,6 +62,8 @@
   let cameraObject = null;
   let drawableId = null;
   let skinId = null;
+  // [ADD] 高度な影RTX の状態（デフォルト off）
+  let rtxShadows = false;
 
   class CanvasSkin extends renderer.exports.Skin {
     constructor(id) {
@@ -136,11 +140,18 @@
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materials.forEach(fn);
   });
+  // [ADD] RTX 影設定をメッシュ群へ反映
+  const applyRTXToObject = root => allMeshes(root).forEach(m => { m.castShadow = rtxShadows; m.receiveShadow = rtxShadows; });
+  const applyRTXToAll = () => {
+    for (const o of objects.values()) applyRTXToObject(o);
+    for (const l of lights.values()) l.castShadow = rtxShadows;
+  };
   const makeObject = n => {
     const old = objects.get(n);
     if (old) { scene.remove(old); disposeObject(old); }
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshStandardMaterial({color:0xffffff}));
     mesh.name = n; mesh.userData.passThrough = false;
+    mesh.castShadow = rtxShadows; mesh.receiveShadow = rtxShadows;
     scene.add(mesh); objects.set(n, mesh);
     return mesh;
   };
@@ -150,6 +161,7 @@
     next.name = n;
     next.position.copy(old.position); next.rotation.copy(old.rotation); next.scale.copy(old.scale);
     next.userData.passThrough = old.userData.passThrough;
+    applyRTXToObject(next);
     scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
   const disposeObject = root => {
@@ -165,9 +177,27 @@
   const updateFog = () => scene.fog = fogEnabled ? new THREE.Fog(fogColor, 1, Math.max(1, fogDistance)) : null;
   const box = root => new THREE.Box3().setFromObject(root);
   const touching = (a,b) => a && b && !a.userData.passThrough && !b.userData.passThrough && box(a).intersectsBox(box(b));
+  // [FIX] pointToward: 視点カメラオブジェクトでターゲット位置へtpする不具合を修正
+  //   - Object3D.lookAt の内部 updateWorldMatrix 副作用を回避し、行列から手動でクォータニオンを計算
+  //   - 位置を保存・復元し、絶対に位置が変化しないことを保証
+  //   - from.rotation (オイラー) も同期し、取得ブロックの値が正しく反映されるようにする
   const pointToward = (from, target) => {
     const p = target instanceof THREE.Vector3 ? target : target.position;
-    from.lookAt(p);
+    const savedPos = from.position.clone();
+    const worldPos = new THREE.Vector3();
+    from.getWorldPosition(worldPos);
+    // 視点カメラオブジェクトは -Z(視線方向)がターゲットを向くようカメラ慣例で計算し y+180 を防ぐ
+    // それ以外は従来通り +Z がターゲットを向くメッシュ慣例で計算
+    const m = new THREE.Matrix4();
+    if (cameraObject && from === objects.get(cameraObject)) {
+      m.lookAt(worldPos, p, from.up);
+    } else {
+      m.lookAt(p, worldPos, from.up);
+    }
+    from.quaternion.setFromRotationMatrix(m);
+    from.rotation.setFromQuaternion(from.quaternion);
+    // 位置不変保証 (tp 不具合の根本対策)
+    from.position.copy(savedPos);
   };
 
   // [FIX] 描画ループの開始関数（二重起動防止）
@@ -265,6 +295,7 @@
         {opcode:"setLightIntensity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},VALUE:{type:N,defaultValue:10}}},
         {opcode:"setLightColor", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の色を [COLOR] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},COLOR:{type:C,defaultValue:"#ffffff"}}},
         {opcode:"setReflectivity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の反射の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
+        {opcode:"setRTXShadows", blockType:BlockType.COMMAND, text:"高度な影RTXを [STATE] にする", arguments:{STATE:{type:S,menu:"onoff"}}},
         "---",
         {opcode:"getPositionX", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の x の位置", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getPositionY", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の y の位置", arguments:{NAME:{type:S,defaultValue:"box"}}},
@@ -279,7 +310,7 @@
       ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff}};
     }
 
-    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())scene.remove(l); lights.clear(); cameraObject=null; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
+    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())scene.remove(l); lights.clear(); cameraObject=null; rtxShadows=false; glRenderer.shadowMap.type=THREE.PCFShadowMap; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
     create(a){makeObject(name(a.NAME));}
     remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}
     setPosition(a){const o=object(a.NAME);if(o)o.position.set(num(a.X),num(a.Y),num(a.Z));}
@@ -320,10 +351,12 @@
     setFogDistance(a){fogDistance=num(a.VALUE);updateFog();}
     setFogColor(a){fogColor=color(a.COLOR);updateFog();}
     setFog(a){fogEnabled=name(a.STATE)==="on";updateFog();}
-    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=new THREE.PointLight(0xffffff,10,100);lights.set(n,l);scene.add(l);}o.getWorldPosition(l.position);}else{const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}}
+    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=new THREE.PointLight(0xffffff,10,100);lights.set(n,l);scene.add(l);}l.castShadow=rtxShadows;o.getWorldPosition(l.position);}else{const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}}
     setLightIntensity(a){const l=lights.get(name(a.NAME));if(l)l.intensity=num(a.VALUE);}
     setLightColor(a){const l=lights.get(name(a.NAME));if(l)l.color.set(color(a.COLOR));}
     setReflectivity(a){const o=object(a.NAME),v=THREE.MathUtils.clamp(num(a.VALUE),0,1);if(o)setMaterial(o,m=>{if("metalness" in m)m.metalness=v;if("roughness" in m)m.roughness=1-v;m.needsUpdate=true;});}
+    // [ADD] 高度な影RTX の on/off (デフォルト off)
+    setRTXShadows(a){rtxShadows=name(a.STATE)==="on";glRenderer.shadowMap.type=rtxShadows?THREE.PCFSoftShadowMap:THREE.PCFShadowMap;glRenderer.shadowMap.needsUpdate=true;applyRTXToAll();}
     getPositionX(a){const o=object(a.NAME);return o?o.position.x:0;}
     getPositionY(a){const o=object(a.NAME);return o?o.position.y:0;}
     getPositionZ(a){const o=object(a.NAME);return o?o.position.z:0;}

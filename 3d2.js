@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: Base44
 // License: MIT
-// Version: 1.0.0
+// Version: 1.1.0
 
 (async function (Scratch) {
   "use strict";
@@ -21,13 +21,27 @@
 
   const canvas = document.createElement("canvas");
   canvas.width = 480; canvas.height = 360;
-  const glRenderer = new THREE.WebGLRenderer({canvas, alpha:true, antialias:true, preserveDrawingBuffer:true});
+  // [FIX] powerPreference を追加し、大型プロジェクトでのGPUリソース枯渇を軽減
+  const glRenderer = new THREE.WebGLRenderer({canvas, alpha:true, antialias:true, preserveDrawingBuffer:true, powerPreference:"high-performance"});
   glRenderer.setPixelRatio(1);
   glRenderer.setSize(480, 360, false);
   glRenderer.outputColorSpace = THREE.SRGBColorSpace;
   glRenderer.shadowMap.enabled = true;
   glRenderer.setClearColor(0x000000, 0);
   glRenderer.autoClear = true;
+
+  // [FIX] WebGLコンテキスト喪失対策（リロード時の大型プロジェクトで発生しやすい）
+  let contextLost = false;
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    contextLost = true;
+    drawing = false;
+  }, false);
+  canvas.addEventListener("webglcontextrestored", () => {
+    contextLost = false;
+    installBackLayer();
+    startRenderLoop();
+  }, false);
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(60, 4/3, 0.1, 10000);
@@ -37,6 +51,8 @@
   const objects = new Map();
   const lights = new Map();
   let drawing = false;
+  // [FIX] 描画ループの生存管理フラグ
+  let loopRunning = false;
   let frame = 0;
   let fogDistance = 100;
   let fogColor = "#ffffff";
@@ -87,7 +103,9 @@
     if (!renderer._layerGroups.backlayer3d) {
       const videoIndex = Math.max(0, renderer._groupOrdering.indexOf("video"));
       renderer._groupOrdering.splice(videoIndex + 1, 0, "backlayer3d");
-      renderer._layerGroups.backlayer3d = {groupIndex:0, drawListOffset:renderer._layerGroups.video.drawListOffset};
+      // [FIX] video レイヤーグループが存在しない場合のフォールバック
+      const videoGroup = renderer._layerGroups.video || {drawListOffset:0};
+      renderer._layerGroups.backlayer3d = {groupIndex:0, drawListOffset:videoGroup.drawListOffset};
       renderer._groupOrdering.forEach((n, index) => renderer._layerGroups[n].groupIndex = index);
     }
     if (!renderer._allSkins[skinId] || !renderer._allDrawables[drawableId]) {
@@ -120,7 +138,7 @@
   });
   const makeObject = n => {
     const old = objects.get(n);
-    if (old) scene.remove(old);
+    if (old) { scene.remove(old); disposeObject(old); }
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshStandardMaterial({color:0xffffff}));
     mesh.name = n; mesh.userData.passThrough = false;
     scene.add(mesh); objects.set(n, mesh);
@@ -132,7 +150,7 @@
     next.name = n;
     next.position.copy(old.position); next.rotation.copy(old.rotation); next.scale.copy(old.scale);
     next.userData.passThrough = old.userData.passThrough;
-    scene.remove(old); scene.add(next); objects.set(n, next);
+    scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
   const disposeObject = root => {
     root.traverse(child => {
@@ -152,9 +170,20 @@
     from.lookAt(p);
   };
 
+  // [FIX] 描画ループの開始関数（二重起動防止）
+  function startRenderLoop() {
+    if (loopRunning) return;
+    loopRunning = true;
+    renderLoop();
+  }
+
   function renderLoop() {
+    // [FIX] ループ停止時は即座に脱出
+    if (!loopRunning) return;
     frame = requestAnimationFrame(renderLoop);
     if (!drawing) return;
+    // [FIX] コンテキスト喪失中は描画をスキップ
+    if (contextLost) return;
     const size = renderer.getNativeSize();
     if (canvas.width !== size[0] || canvas.height !== size[1]) {
       glRenderer.setSize(size[0], size[1], false);
@@ -176,7 +205,8 @@
     if (skin) skin.update();
     runtime.requestRedraw();
   }
-  renderLoop();
+  // [FIX] renderLoop() → startRenderLoop() に変更
+  startRenderLoop();
 
   class BackLayer3D {
     getInfo() {
@@ -310,8 +340,22 @@
     async modelList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;let root;if(items.every(v=>Number.isFinite(Number(v))&&Number(v)>=0&&Number(v)<=255)){const bytes=new Uint8Array(items.map(Number));const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(bytes.buffer,"",resolve,reject));root=gltf.scene;}else{const text=items.join("\n").trim();if(text.startsWith("{")||text.startsWith("[")){const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(text,"",resolve,reject));root=gltf.scene;}else root=new OBJLoader().parse(text);}replaceObject(n,root);}
   }
 
-  runtime.on("PROJECT_STOP_ALL",()=>{drawing=false;clearSkin();});
-  runtime.on("PROJECT_LOADED",()=>{drawing=false;installBackLayer();});
-  runtime.on("RUNTIME_DISPOSED",()=>{cancelAnimationFrame(frame);glRenderer.dispose();});
+  // [FIX] PROJECT_STOP_ALL: 描画停止＋スキンクリア（変更なし）
+  runtime.on("PROJECT_STOP_ALL", () => { drawing = false; clearSkin(); });
+
+  // [FIX] PROJECT_LOADED: バックレイヤー再インストール ＋ 描画ループ再開
+  runtime.on("PROJECT_LOADED", () => {
+    drawing = false;
+    installBackLayer();
+    startRenderLoop();
+  });
+
+  // [FIX] RUNTIME_DISPOSED: glRenderer.dispose() と cancelAnimationFrame を削除
+  //   → プロジェクト再読み込み時にレンダラーと描画ループが生き続ける
+  runtime.on("RUNTIME_DISPOSED", () => {
+    drawing = false;
+    clearSkin();
+  });
+
   Scratch.extensions.register(new BackLayer3D());
 })(Scratch);

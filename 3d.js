@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: Base44
 // License: MIT
-// Version: 1.2.0
+// Version: 1.2.1
 
 (async function (Scratch) {
   "use strict";
@@ -21,18 +21,15 @@
 
   const canvas = document.createElement("canvas");
   canvas.width = 480; canvas.height = 360;
-  // [FIX] powerPreference を追加し、大型プロジェクトでのGPUリソース枯渇を軽減
   const glRenderer = new THREE.WebGLRenderer({canvas, alpha:true, antialias:true, preserveDrawingBuffer:true, powerPreference:"high-performance"});
   glRenderer.setPixelRatio(1);
   glRenderer.setSize(480, 360, false);
   glRenderer.outputColorSpace = THREE.SRGBColorSpace;
   glRenderer.shadowMap.enabled = true;
-  // [ADD] RTX 高度な影: デフォルトは基本品質(off)。on で PCFSoftShadowMap に切り替え
   glRenderer.shadowMap.type = THREE.PCFShadowMap;
   glRenderer.setClearColor(0x000000, 0);
   glRenderer.autoClear = true;
 
-  // [FIX] WebGLコンテキスト喪失対策（リロード時の大型プロジェクトで発生しやすい）
   let contextLost = false;
   canvas.addEventListener("webglcontextlost", (e) => {
     e.preventDefault();
@@ -53,7 +50,6 @@
   const objects = new Map();
   const lights = new Map();
   let drawing = false;
-  // [FIX] 描画ループの生存管理フラグ
   let loopRunning = false;
   let frame = 0;
   let fogDistance = 100;
@@ -62,8 +58,13 @@
   let cameraObject = null;
   let drawableId = null;
   let skinId = null;
-  // [ADD] 高度な影RTX の状態（デフォルト off）
   let rtxShadows = false;
+
+  // [FIX] Reusable scratch objects to avoid per-call allocation
+  const _localAxisX = new THREE.Vector3(1, 0, 0);
+  const _localAxisY = new THREE.Vector3(0, 1, 0);
+  const _localAxisZ = new THREE.Vector3(0, 0, 1);
+  const _deltaQuat = new THREE.Quaternion();
 
   class CanvasSkin extends renderer.exports.Skin {
     constructor(id) {
@@ -107,7 +108,6 @@
     if (!renderer._layerGroups.backlayer3d) {
       const videoIndex = Math.max(0, renderer._groupOrdering.indexOf("video"));
       renderer._groupOrdering.splice(videoIndex + 1, 0, "backlayer3d");
-      // [FIX] video レイヤーグループが存在しない場合のフォールバック
       const videoGroup = renderer._layerGroups.video || {drawListOffset:0};
       renderer._layerGroups.backlayer3d = {groupIndex:0, drawListOffset:videoGroup.drawListOffset};
       renderer._groupOrdering.forEach((n, index) => renderer._layerGroups[n].groupIndex = index);
@@ -140,7 +140,6 @@
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materials.forEach(fn);
   });
-  // [ADD] RTX 影設定をメッシュ群へ反映
   const applyRTXToObject = root => allMeshes(root).forEach(m => { m.castShadow = rtxShadows; m.receiveShadow = rtxShadows; });
   const applyRTXToAll = () => {
     for (const o of objects.values()) applyRTXToObject(o);
@@ -177,17 +176,11 @@
   const updateFog = () => scene.fog = fogEnabled ? new THREE.Fog(fogColor, 1, Math.max(1, fogDistance)) : null;
   const box = root => new THREE.Box3().setFromObject(root);
   const touching = (a,b) => a && b && !a.userData.passThrough && !b.userData.passThrough && box(a).intersectsBox(box(b));
-  // [FIX] pointToward: 視点カメラオブジェクトでターゲット位置へtpする不具合を修正
-  //   - Object3D.lookAt の内部 updateWorldMatrix 副作用を回避し、行列から手動でクォータニオンを計算
-  //   - 位置を保存・復元し、絶対に位置が変化しないことを保証
-  //   - from.rotation (オイラー) も同期し、取得ブロックの値が正しく反映されるようにする
   const pointToward = (from, target) => {
     const p = target instanceof THREE.Vector3 ? target : target.position;
     const savedPos = from.position.clone();
     const worldPos = new THREE.Vector3();
     from.getWorldPosition(worldPos);
-    // 視点カメラオブジェクトは -Z(視線方向)がターゲットを向くようカメラ慣例で計算し y+180 を防ぐ
-    // それ以外は従来通り +Z がターゲットを向くメッシュ慣例で計算
     const m = new THREE.Matrix4();
     if (cameraObject && from === objects.get(cameraObject)) {
       m.lookAt(worldPos, p, from.up);
@@ -196,11 +189,9 @@
     }
     from.quaternion.setFromRotationMatrix(m);
     from.rotation.setFromQuaternion(from.quaternion);
-    // 位置不変保証 (tp 不具合の根本対策)
     from.position.copy(savedPos);
   };
 
-  // [FIX] 描画ループの開始関数（二重起動防止）
   function startRenderLoop() {
     if (loopRunning) return;
     loopRunning = true;
@@ -208,11 +199,9 @@
   }
 
   function renderLoop() {
-    // [FIX] ループ停止時は即座に脱出
     if (!loopRunning) return;
     frame = requestAnimationFrame(renderLoop);
     if (!drawing) return;
-    // [FIX] コンテキスト喪失中は描画をスキップ
     if (contextLost) return;
     const size = renderer.getNativeSize();
     if (canvas.width !== size[0] || canvas.height !== size[1]) {
@@ -235,7 +224,6 @@
     if (skin) skin.update();
     runtime.requestRedraw();
   }
-  // [FIX] renderLoop() → startRenderLoop() に変更
   startRenderLoop();
 
   class BackLayer3D {
@@ -264,6 +252,7 @@
         {opcode:"changeRotationX", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを x [VALUE] ずつ変える", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
         {opcode:"changeRotationY", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを y [VALUE] ずつ変える", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
         {opcode:"changeRotationZ", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを z [VALUE] ずつ変える", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
+        {opcode:"changeRotationYWorld", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを y [VALUE] ずつ変える しかしオブジェクトが向いてる方向ではない", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
         {opcode:"setScale", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の大きさを x [X] y [Y] z [Z] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},X:{type:N,defaultValue:100},Y:{type:N,defaultValue:100},Z:{type:N,defaultValue:100}}},
         {opcode:"setScaleX", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の大きさを x [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:100}}},
         {opcode:"setScaleY", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の大きさを y [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:100}}},
@@ -324,9 +313,14 @@
     setRotationX(a){const o=object(a.NAME);if(o)o.rotation.x=THREE.MathUtils.degToRad(num(a.VALUE));}
     setRotationY(a){const o=object(a.NAME);if(o)o.rotation.y=THREE.MathUtils.degToRad(num(a.VALUE));}
     setRotationZ(a){const o=object(a.NAME);if(o)o.rotation.z=THREE.MathUtils.degToRad(num(a.VALUE));}
-    changeRotationX(a){const o=object(a.NAME);if(o)o.rotation.x+=THREE.MathUtils.degToRad(num(a.VALUE));}
-    changeRotationY(a){const o=object(a.NAME);if(o)o.rotation.y+=THREE.MathUtils.degToRad(num(a.VALUE));}
-    changeRotationZ(a){const o=object(a.NAME);if(o)o.rotation.z+=THREE.MathUtils.degToRad(num(a.VALUE));}
+    // [FIX v1.2.1] ローカル軸回転: オブジェクトの向き基準で回転する
+    //   Before: o.rotation.x += deg (ワールド軸の Euler 回転 → オブジェクトが向いてる方向と無関係)
+    //   After:  quaternion.multiply(deltaQuat on local axis) → オブジェクトのローカル軸で回転
+    changeRotationX(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisX,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    changeRotationY(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisY,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    changeRotationZ(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisZ,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    // [ADD v1.2.1] ワールド軸Y回転（オブジェクトの向きを無視した絶対Y回転）
+    changeRotationYWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisY,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
     setScale(a){const o=object(a.NAME);if(o)o.scale.set(num(a.X)/100,num(a.Y)/100,num(a.Z)/100);}
     setScaleX(a){const o=object(a.NAME);if(o)o.scale.x=num(a.VALUE)/100;}
     setScaleY(a){const o=object(a.NAME);if(o)o.scale.y=num(a.VALUE)/100;}
@@ -355,7 +349,6 @@
     setLightIntensity(a){const l=lights.get(name(a.NAME));if(l)l.intensity=num(a.VALUE);}
     setLightColor(a){const l=lights.get(name(a.NAME));if(l)l.color.set(color(a.COLOR));}
     setReflectivity(a){const o=object(a.NAME),v=THREE.MathUtils.clamp(num(a.VALUE),0,1);if(o)setMaterial(o,m=>{if("metalness" in m)m.metalness=v;if("roughness" in m)m.roughness=1-v;m.needsUpdate=true;});}
-    // [ADD] 高度な影RTX の on/off (デフォルト off)
     setRTXShadows(a){rtxShadows=name(a.STATE)==="on";glRenderer.shadowMap.type=rtxShadows?THREE.PCFSoftShadowMap:THREE.PCFShadowMap;glRenderer.shadowMap.needsUpdate=true;applyRTXToAll();}
     getPositionX(a){const o=object(a.NAME);return o?o.position.x:0;}
     getPositionY(a){const o=object(a.NAME);return o?o.position.y:0;}
@@ -373,18 +366,14 @@
     async modelList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;let root;if(items.every(v=>Number.isFinite(Number(v))&&Number(v)>=0&&Number(v)<=255)){const bytes=new Uint8Array(items.map(Number));const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(bytes.buffer,"",resolve,reject));root=gltf.scene;}else{const text=items.join("\n").trim();if(text.startsWith("{")||text.startsWith("[")){const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(text,"",resolve,reject));root=gltf.scene;}else root=new OBJLoader().parse(text);}replaceObject(n,root);}
   }
 
-  // [FIX] PROJECT_STOP_ALL: 描画停止＋スキンクリア（変更なし）
   runtime.on("PROJECT_STOP_ALL", () => { drawing = false; clearSkin(); });
 
-  // [FIX] PROJECT_LOADED: バックレイヤー再インストール ＋ 描画ループ再開
   runtime.on("PROJECT_LOADED", () => {
     drawing = false;
     installBackLayer();
     startRenderLoop();
   });
 
-  // [FIX] RUNTIME_DISPOSED: glRenderer.dispose() と cancelAnimationFrame を削除
-  //   → プロジェクト再読み込み時にレンダラーと描画ループが生き続ける
   runtime.on("RUNTIME_DISPOSED", () => {
     drawing = false;
     clearSkin();

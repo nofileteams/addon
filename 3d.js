@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.3.1
+// Version: 1.4.1
 
 (async function (Scratch) {
   "use strict";
@@ -55,6 +55,14 @@
   let fogDistance = 100;
   let fogColor = "#ffffff";
   let fogEnabled = false;
+  let fogHueEffect = 0;
+  let fogBrightnessEffect = 0;
+  let worldBrightness = 0.65;
+  let skyDome = null;
+  let skyTexture = null;
+  let skyEffectTexture = null;
+  let skyHueEffect = 0;
+  let skyBrightnessEffect = 0;
   let cameraObject = null;
   let drawableId = null;
   let skinId = null;
@@ -142,10 +150,10 @@
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materials.forEach(fn);
   });
-  const applyRTXToObject = root => allMeshes(root).forEach(m => { m.castShadow = rtxShadows; m.receiveShadow = rtxShadows; });
+  const applyRTXToObject = root => allMeshes(root).forEach(m => { m.castShadow = rtxShadows; m.receiveShadow = rtxShadows; if(m.material){(Array.isArray(m.material)?m.material:[m.material]).forEach(mat=>mat.needsUpdate=true);}});
   const applyRTXToAll = () => {
     for (const o of objects.values()) applyRTXToObject(o);
-    for (const l of lights.values()) l.castShadow = rtxShadows;
+    for (const l of lights.values()) { l.castShadow = rtxShadows; configureLightShadow(l); }
   };
   const makeObject = n => {
     const old = objects.get(n);
@@ -155,6 +163,7 @@
     mesh.userData.passThrough = false;
     mesh.userData.physics = false;
     mesh.userData.velocityY = 0;
+    mesh.userData.lightType = "全体";
     mesh.castShadow = rtxShadows; mesh.receiveShadow = rtxShadows;
     scene.add(mesh); objects.set(n, mesh);
     return mesh;
@@ -167,6 +176,7 @@
     next.userData.passThrough = old.userData.passThrough;
     next.userData.physics = old.userData.physics || false;
     next.userData.velocityY = old.userData.velocityY || 0;
+    next.userData.lightType = old.userData.lightType || "全体";
     applyRTXToObject(next);
     scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
@@ -200,9 +210,88 @@
     action.play();
     return action;
   };
-  const updateFog = () => scene.fog = fogEnabled ? new THREE.Fog(fogColor, 1, Math.max(1, fogDistance)) : null;
+  const effectedFogColor = () => {
+    const c = new THREE.Color(fogColor);
+    const hsl = {}; c.getHSL(hsl);
+    hsl.h = (hsl.h + fogHueEffect / 200) % 1;
+    if (hsl.h < 0) hsl.h += 1;
+    if (fogBrightnessEffect >= 0) hsl.l += (1 - hsl.l) * fogBrightnessEffect / 100;
+    else hsl.l *= 1 + fogBrightnessEffect / 100;
+    return new THREE.Color().setHSL(hsl.h, hsl.s, THREE.MathUtils.clamp(hsl.l, 0, 1));
+  };
+  const updateFog = () => {
+    if (!fogEnabled) { scene.fog = null; return; }
+    const far = Math.max(1, fogDistance);
+    scene.fog = new THREE.Fog(effectedFogColor(), Math.max(0, far * 0.12), far);
+  };
   const box = root => new THREE.Box3().setFromObject(root);
-  const touching = (a,b) => a && b && !a.userData.passThrough && !b.userData.passThrough && box(a).intersectsBox(box(b));
+  const touching = (a,b) => Boolean(a && b && !a.userData.passThrough && !b.userData.passThrough && box(a).intersectsBox(box(b)));
+  const removeLight = light => { if (light.target) scene.remove(light.target); scene.remove(light); };
+  const configureLightShadow = (light) => {
+    if (!light.shadow) return;
+    light.shadow.mapSize.set(1024, 1024);
+    light.shadow.camera.near = 0.1;
+    light.shadow.camera.far = 200;
+    light.shadow.bias = -0.0005;
+    light.shadow.normalBias = 0.02;
+    if (light.shadow.camera.updateProjectionMatrix) light.shadow.camera.updateProjectionMatrix();
+  };
+  const makeLight = (type, intensity=10, lightColor=0xffffff) => {
+    let light;
+    if (type === "向いてる方向") {
+      light = new THREE.SpotLight(lightColor, intensity, 100, Math.PI / 4, 0.25, 1);
+      scene.add(light.target);
+    } else {
+      light = new THREE.PointLight(lightColor, intensity, 100);
+    }
+    configureLightShadow(light);
+    return light;
+  };
+  const syncLight = (source, light) => {
+    source.getWorldPosition(light.position);
+    if (light.isSpotLight) {
+      const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(source.getWorldQuaternion(new THREE.Quaternion()));
+      light.target.position.copy(light.position).add(direction);
+      light.target.updateMatrixWorld();
+    }
+  };
+  const applySkyEffects = () => {
+    if (!skyDome || !skyTexture || !skyTexture.image) return;
+    const image = skyTexture.image;
+    const width = image.naturalWidth || image.videoWidth || image.width;
+    const height = image.naturalHeight || image.videoHeight || image.height;
+    if (!width || !height) return;
+    const effectCanvas = document.createElement("canvas");
+    effectCanvas.width = width; effectCanvas.height = height;
+    const context = effectCanvas.getContext("2d", {willReadFrequently:true});
+    context.drawImage(image, 0, 0, width, height);
+    const pixels = context.getImageData(0, 0, width, height);
+    const angle = skyHueEffect / 200 * Math.PI * 2;
+    const c = Math.cos(angle), s = Math.sin(angle);
+    const matrix = [
+      .213+c*.787-s*.213, .715-c*.715-s*.715, .072-c*.072+s*.928,
+      .213-c*.213+s*.143, .715+c*.285+s*.140, .072-c*.072-s*.283,
+      .213-c*.213-s*.787, .715-c*.715+s*.715, .072+c*.928+s*.072
+    ];
+    const brightness = THREE.MathUtils.clamp(skyBrightnessEffect, -100, 100) / 100;
+    for (let i=0; i<pixels.data.length; i+=4) {
+      const r=pixels.data[i], g=pixels.data[i+1], b=pixels.data[i+2];
+      let nr=r*matrix[0]+g*matrix[1]+b*matrix[2];
+      let ng=r*matrix[3]+g*matrix[4]+b*matrix[5];
+      let nb=r*matrix[6]+g*matrix[7]+b*matrix[8];
+      if (brightness >= 0) { nr+=(255-nr)*brightness; ng+=(255-ng)*brightness; nb+=(255-nb)*brightness; }
+      else { nr*=1+brightness; ng*=1+brightness; nb*=1+brightness; }
+      pixels.data[i]=nr; pixels.data[i+1]=ng; pixels.data[i+2]=nb;
+    }
+    context.putImageData(pixels, 0, 0);
+    if (skyEffectTexture) skyEffectTexture.dispose();
+    skyEffectTexture = new THREE.CanvasTexture(effectCanvas);
+    skyEffectTexture.colorSpace = THREE.SRGBColorSpace;
+    skyDome.material.map = skyEffectTexture;
+    const factor = THREE.MathUtils.clamp(worldBrightness / 5, 0, 10);
+    skyDome.material.color.setRGB(factor, factor, factor);
+    skyDome.material.needsUpdate = true;
+  };
   const pointToward = (from, target) => {
     const p = target instanceof THREE.Vector3 ? target : target.position;
     const savedPos = from.position.clone();
@@ -265,9 +354,10 @@
       sourceObject.getWorldPosition(camera.position);
       sourceObject.getWorldQuaternion(camera.quaternion);
     }
+    if (skyDome) skyDome.position.copy(camera.position);
     for (const [lightName, light] of lights) {
       const sourceObject = objects.get(lightName);
-      if (sourceObject) sourceObject.getWorldPosition(light.position);
+      if (sourceObject) syncLight(sourceObject, light);
     }
     glRenderer.render(scene, camera);
     const skin = renderer._allSkins[skinId];
@@ -280,6 +370,7 @@
     getInfo() {
       const S = ArgumentType.STRING, N = ArgumentType.NUMBER, C = ArgumentType.COLOR;
       const onoff = {acceptReporters:true, items:["on","off"]};
+      const lighttype = {acceptReporters:true, items:["全体","向いてる方向"]};
       return {id:"backlayer3d", name:"BackLayer 3D", color1:"#5B5FEF", color2:"#4549C4", blocks:[
         {opcode:"reset", blockType:BlockType.COMMAND, text:"reset all"},
         {opcode:"create", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を作成する", arguments:{NAME:{type:S,defaultValue:"box"}}},
@@ -328,19 +419,29 @@
         {opcode:"setPhysics", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のphysicsを [STATE] にする", arguments:{NAME:{type:S,defaultValue:"box"},STATE:{type:S,menu:"onoff"}}},
         {opcode:"bounce", blockType:BlockType.COMMAND, text:"もしオブジェクト [NAME] が他のオブジェクトに触れたら跳ね返る", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"isTouching", blockType:BlockType.BOOLEAN, text:"オブジェクト [NAME] がオブジェクト [TARGET] に触れた", arguments:{NAME:{type:S,defaultValue:"box"},TARGET:{type:S,defaultValue:"target"}}},
+        {opcode:"objectExists", blockType:BlockType.BOOLEAN, text:"オブジェクト [NAME] が存在する？", arguments:{NAME:{type:S,defaultValue:"box"}}},
         "---",
         {opcode:"start", blockType:BlockType.COMMAND, text:"描画を開始する"},
         {opcode:"stop", blockType:BlockType.COMMAND, text:"描画を止める"},
         {opcode:"isDrawing", blockType:BlockType.BOOLEAN, text:"今は描画中？"},
         {opcode:"setFogDistance", blockType:BlockType.COMMAND, text:"fogの距離を [VALUE] にする", arguments:{VALUE:{type:N,defaultValue:100}}},
         {opcode:"setFogColor", blockType:BlockType.COMMAND, text:"fogの色を [COLOR] にする", arguments:{COLOR:{type:C,defaultValue:"#ffffff"}}},
+        {opcode:"changeFogColor", blockType:BlockType.COMMAND, text:"fogの色を [VALUE] ずつ変える", arguments:{VALUE:{type:N,defaultValue:10}}},
+        {opcode:"changeFogBrightness", blockType:BlockType.COMMAND, text:"fogの明るさを [VALUE] ずつ変える", arguments:{VALUE:{type:N,defaultValue:1}}},
         {opcode:"setFog", blockType:BlockType.COMMAND, text:"fogを [STATE] にする", arguments:{STATE:{type:S,menu:"onoff"}}},
+        {opcode:"setWorldBrightness", blockType:BlockType.COMMAND, text:"世界の明るさを [VALUE] にする", arguments:{VALUE:{type:N,defaultValue:5}}},
+        {opcode:"changeWorldBrightness", blockType:BlockType.COMMAND, text:"世界の明るさを [VALUE] ずつ変える", arguments:{VALUE:{type:N,defaultValue:1}}},
         "---",
         {opcode:"setLight", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を光源にする [STATE]", arguments:{NAME:{type:S,defaultValue:"light"},STATE:{type:S,menu:"onoff"}}},
         {opcode:"setLightIntensity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},VALUE:{type:N,defaultValue:10}}},
         {opcode:"setLightColor", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の色を [COLOR] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},COLOR:{type:C,defaultValue:"#ffffff"}}},
+        {opcode:"setLightType", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光タイプを [TYPE] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},TYPE:{type:S,menu:"lighttype"}}},
+        {opcode:"setSkyCostume", blockType:BlockType.COMMAND, text:"空を [COSTUME] に設定する", arguments:{COSTUME:{type:S,defaultValue:"costume1"}}},
+        {opcode:"changeSkyColor", blockType:BlockType.COMMAND, text:"空の色の効果を [VALUE] ずつ変える", arguments:{VALUE:{type:N,defaultValue:1}}},
+        {opcode:"changeSkyBrightness", blockType:BlockType.COMMAND, text:"空の明るさの効果を [VALUE] ずつ変える", arguments:{VALUE:{type:N,defaultValue:1}}},
+        {opcode:"setSkyColorEffect", blockType:BlockType.COMMAND, text:"空の色の効果を [VALUE] にする", arguments:{VALUE:{type:N,defaultValue:0}}},
+        {opcode:"setSkyBrightnessEffect", blockType:BlockType.COMMAND, text:"空の明るさの効果を [VALUE] にする", arguments:{VALUE:{type:N,defaultValue:0}}},
         {opcode:"setReflectivity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の反射の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
-        {opcode:"setRTXShadows", blockType:BlockType.COMMAND, text:"高度な影RTXを [STATE] にする", arguments:{STATE:{type:S,menu:"onoff"}}},
         "---",
         {opcode:"getPositionX", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の x の位置", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getPositionY", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の y の位置", arguments:{NAME:{type:S,defaultValue:"box"}}},
@@ -352,12 +453,12 @@
         {opcode:"getScaleY", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の y の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getScaleZ", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の z の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"distance", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] からオブジェクト [TARGET] までの距離", arguments:{NAME:{type:S,defaultValue:"box"},TARGET:{type:S,defaultValue:"target"}}}
-      ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff}};
+      ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff,lighttype}};
     }
 
-    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())scene.remove(l); lights.clear(); cameraObject=null; rtxShadows=false; glRenderer.shadowMap.type=THREE.PCFShadowMap; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
+    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; rtxShadows=false; glRenderer.shadowMap.type=THREE.PCFShadowMap; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
     create(a){makeObject(name(a.NAME));}
-    remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}
+    remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}
     setPosition(a){const o=object(a.NAME);if(o)o.position.set(num(a.X),num(a.Y),num(a.Z));}
     setPositionX(a){const o=object(a.NAME);if(o)o.position.x=num(a.VALUE);}
     setPositionY(a){const o=object(a.NAME);if(o)o.position.y=num(a.VALUE);}
@@ -396,19 +497,41 @@
     setOpacity(a){const o=object(a.NAME),opacity=THREE.MathUtils.clamp(1-num(a.VALUE)/100,0,1);if(o)setMaterial(o,m=>{m.transparent=opacity<1;m.opacity=opacity;m.needsUpdate=true;});}
     setPassThrough(a){const o=object(a.NAME);if(o)o.userData.passThrough=name(a.STATE)==="on";}
     setPhysics(a){const o=object(a.NAME);if(o){o.userData.physics=name(a.STATE)==="on";if(!o.userData.physics)o.userData.velocityY=0;}}
-    isTouching(a){return touching(object(a.NAME),object(a.TARGET));}
-    bounce(a){const o=object(a.NAME);if(!o||o.userData.passThrough)return;for(const other of objects.values()){if(other!==o&&touching(o,other)){const delta=o.position.clone().sub(other.position);if(Math.abs(delta.x)>=Math.abs(delta.y)&&Math.abs(delta.x)>=Math.abs(delta.z))o.position.x+=Math.sign(delta.x||1)*0.2;else if(Math.abs(delta.y)>=Math.abs(delta.z))o.position.y+=Math.sign(delta.y||1)*0.2;else o.position.z+=Math.sign(delta.z||1)*0.2;break;}}}
+    isTouching(a){return Boolean(touching(object(a.NAME),object(a.TARGET)));}
+    objectExists(a){return objects.has(name(a.NAME));}
+    bounce(a){
+      const o=object(a.NAME); if(!o||o.userData.passThrough)return;
+      for(const other of objects.values()){
+        if(other===o||other.userData.passThrough)continue;
+        const aBox=box(o),bBox=box(other); if(!aBox.intersectsBox(bBox))continue;
+        const overlaps=[Math.min(aBox.max.x-bBox.min.x,bBox.max.x-aBox.min.x),Math.min(aBox.max.y-bBox.min.y,bBox.max.y-aBox.min.y),Math.min(aBox.max.z-bBox.min.z,bBox.max.z-aBox.min.z)];
+        const axis=overlaps.indexOf(Math.min(...overlaps)); if(overlaps[axis]<=1e-7)continue;
+        const centerA=aBox.getCenter(new THREE.Vector3()),centerB=bBox.getCenter(new THREE.Vector3());
+        const key=["x","y","z"][axis],direction=centerA[key]>=centerB[key]?1:-1;
+        o.position[key]+=direction*(overlaps[axis]+1e-5);
+        if(key==="y")o.userData.velocityY=0;
+      }
+    }
     start(){drawing=true;}
     stop(){drawing=false;clearSkin();}
     isDrawing(){return drawing;}
     setFogDistance(a){fogDistance=num(a.VALUE);updateFog();}
     setFogColor(a){fogColor=color(a.COLOR);updateFog();}
+    changeFogColor(a){fogHueEffect=(fogHueEffect+num(a.VALUE))%200;updateFog();}
+    changeFogBrightness(a){fogBrightnessEffect=THREE.MathUtils.clamp(fogBrightnessEffect+num(a.VALUE),-100,100);updateFog();}
     setFog(a){fogEnabled=name(a.STATE)==="on";updateFog();}
-    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=new THREE.PointLight(0xffffff,10,100);lights.set(n,l);scene.add(l);}l.castShadow=rtxShadows;o.getWorldPosition(l.position);}else{const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}}
+    setWorldBrightness(a){worldBrightness=Math.max(0,num(a.VALUE));applySkyEffects();}
+    changeWorldBrightness(a){worldBrightness=Math.max(0,worldBrightness+num(a.VALUE));applySkyEffects();}
+    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=makeLight(o.userData.lightType||"全体");lights.set(n,l);scene.add(l);}l.castShadow=rtxShadows;syncLight(o,l);}else{const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}}
     setLightIntensity(a){const l=lights.get(name(a.NAME));if(l)l.intensity=num(a.VALUE);}
     setLightColor(a){const l=lights.get(name(a.NAME));if(l)l.color.set(color(a.COLOR));}
+    setLightType(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;const type=name(a.TYPE)==="向いてる方向"?"向いてる方向":"全体";o.userData.lightType=type;const old=lights.get(n);if(old){const next=makeLight(type,old.intensity,old.color);next.castShadow=rtxShadows;removeLight(old);lights.set(n,next);scene.add(next);syncLight(o,next);}}
+    async setSkyCostume(a,util){const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;if(skyDome){scene.remove(skyDome);disposeObject(skyDome);}skyTexture=texture;skyDome=new THREE.Mesh(new THREE.SphereGeometry(500,60,40),new THREE.MeshBasicMaterial({map:texture,side:THREE.BackSide,fog:false,depthWrite:false}));skyDome.renderOrder=-1;scene.add(skyDome);applySkyEffects();}
+    changeSkyColor(a){skyHueEffect=(skyHueEffect+num(a.VALUE))%200;applySkyEffects();}
+    changeSkyBrightness(a){skyBrightnessEffect=THREE.MathUtils.clamp(skyBrightnessEffect+num(a.VALUE),-100,100);applySkyEffects();}
+    setSkyColorEffect(a){skyHueEffect=num(a.VALUE)%200;applySkyEffects();}
+    setSkyBrightnessEffect(a){skyBrightnessEffect=THREE.MathUtils.clamp(num(a.VALUE),-100,100);applySkyEffects();}
     setReflectivity(a){const o=object(a.NAME),v=THREE.MathUtils.clamp(num(a.VALUE),0,1);if(o)setMaterial(o,m=>{if("metalness" in m)m.metalness=v;if("roughness" in m)m.roughness=1-v;m.needsUpdate=true;});}
-    setRTXShadows(a){rtxShadows=name(a.STATE)==="on";glRenderer.shadowMap.type=rtxShadows?THREE.PCFSoftShadowMap:THREE.PCFShadowMap;glRenderer.shadowMap.needsUpdate=true;applyRTXToAll();}
     getPositionX(a){const o=object(a.NAME);return o?o.position.x:0;}
     getPositionY(a){const o=object(a.NAME);return o?o.position.y:0;}
     getPositionZ(a){const o=object(a.NAME);return o?o.position.z:0;}

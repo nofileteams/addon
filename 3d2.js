@@ -1,9 +1,9 @@
 // Name: BackLayer 3D
 // ID: backlayer3d
 // Description: 3D objects rendered behind every Scratch sprite.
-// By: Base44
+// By: nofileteams
 // License: MIT
-// Version: 1.1.0
+// Version: 1.3.1
 
 (async function (Scratch) {
   "use strict";
@@ -21,16 +21,15 @@
 
   const canvas = document.createElement("canvas");
   canvas.width = 480; canvas.height = 360;
-  // [FIX] powerPreference を追加し、大型プロジェクトでのGPUリソース枯渇を軽減
   const glRenderer = new THREE.WebGLRenderer({canvas, alpha:true, antialias:true, preserveDrawingBuffer:true, powerPreference:"high-performance"});
   glRenderer.setPixelRatio(1);
   glRenderer.setSize(480, 360, false);
   glRenderer.outputColorSpace = THREE.SRGBColorSpace;
   glRenderer.shadowMap.enabled = true;
+  glRenderer.shadowMap.type = THREE.PCFShadowMap;
   glRenderer.setClearColor(0x000000, 0);
   glRenderer.autoClear = true;
 
-  // [FIX] WebGLコンテキスト喪失対策（リロード時の大型プロジェクトで発生しやすい）
   let contextLost = false;
   canvas.addEventListener("webglcontextlost", (e) => {
     e.preventDefault();
@@ -51,7 +50,6 @@
   const objects = new Map();
   const lights = new Map();
   let drawing = false;
-  // [FIX] 描画ループの生存管理フラグ
   let loopRunning = false;
   let frame = 0;
   let fogDistance = 100;
@@ -60,6 +58,15 @@
   let cameraObject = null;
   let drawableId = null;
   let skinId = null;
+  let rtxShadows = false;
+
+  // [FIX] Reusable scratch objects to avoid per-call allocation
+  const _localAxisX = new THREE.Vector3(1, 0, 0);
+  const _localAxisY = new THREE.Vector3(0, 1, 0);
+  const _localAxisZ = new THREE.Vector3(0, 0, 1);
+  const _deltaQuat = new THREE.Quaternion();
+  const _physicsClock = new THREE.Clock();
+  const GRAVITY = -9.8;
 
   class CanvasSkin extends renderer.exports.Skin {
     constructor(id) {
@@ -103,7 +110,6 @@
     if (!renderer._layerGroups.backlayer3d) {
       const videoIndex = Math.max(0, renderer._groupOrdering.indexOf("video"));
       renderer._groupOrdering.splice(videoIndex + 1, 0, "backlayer3d");
-      // [FIX] video レイヤーグループが存在しない場合のフォールバック
       const videoGroup = renderer._layerGroups.video || {drawListOffset:0};
       renderer._layerGroups.backlayer3d = {groupIndex:0, drawListOffset:videoGroup.drawListOffset};
       renderer._groupOrdering.forEach((n, index) => renderer._layerGroups[n].groupIndex = index);
@@ -136,11 +142,20 @@
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materials.forEach(fn);
   });
+  const applyRTXToObject = root => allMeshes(root).forEach(m => { m.castShadow = rtxShadows; m.receiveShadow = rtxShadows; });
+  const applyRTXToAll = () => {
+    for (const o of objects.values()) applyRTXToObject(o);
+    for (const l of lights.values()) l.castShadow = rtxShadows;
+  };
   const makeObject = n => {
     const old = objects.get(n);
     if (old) { scene.remove(old); disposeObject(old); }
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), new THREE.MeshStandardMaterial({color:0xffffff}));
-    mesh.name = n; mesh.userData.passThrough = false;
+    mesh.name = n;
+    mesh.userData.passThrough = false;
+    mesh.userData.physics = false;
+    mesh.userData.velocityY = 0;
+    mesh.castShadow = rtxShadows; mesh.receiveShadow = rtxShadows;
     scene.add(mesh); objects.set(n, mesh);
     return mesh;
   };
@@ -150,6 +165,9 @@
     next.name = n;
     next.position.copy(old.position); next.rotation.copy(old.rotation); next.scale.copy(old.scale);
     next.userData.passThrough = old.userData.passThrough;
+    next.userData.physics = old.userData.physics || false;
+    next.userData.velocityY = old.userData.velocityY || 0;
+    applyRTXToObject(next);
     scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
   const disposeObject = root => {
@@ -162,15 +180,65 @@
     const variable = util.target.lookupVariableByNameAndType(name(listName), "list");
     return variable ? variable.value : [];
   };
+  const loadGLTFList = async items => {
+    const numeric = items.length > 0 && items.every(v => Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) <= 255);
+    const data = numeric ? Uint8Array.from(items, Number).buffer : items.join("\n").trim();
+    const gltf = await new Promise((resolve, reject) => new GLTFLoader().parse(data, "", resolve, reject));
+    gltf.scene.userData.animationClips = gltf.animations || [];
+    gltf.scene.userData.animationMixer = new THREE.AnimationMixer(gltf.scene);
+    return gltf.scene;
+  };
+  const playObjectAnimation = (root, animationName) => {
+    if (!root || !root.userData.animationMixer) return null;
+    const clip = root.userData.animationClips.find(item => item.name === name(animationName));
+    if (!clip) return null;
+    const mixer = root.userData.animationMixer;
+    mixer.stopAllAction();
+    const action = mixer.clipAction(clip);
+    action.reset().setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    action.play();
+    return action;
+  };
   const updateFog = () => scene.fog = fogEnabled ? new THREE.Fog(fogColor, 1, Math.max(1, fogDistance)) : null;
   const box = root => new THREE.Box3().setFromObject(root);
   const touching = (a,b) => a && b && !a.userData.passThrough && !b.userData.passThrough && box(a).intersectsBox(box(b));
   const pointToward = (from, target) => {
     const p = target instanceof THREE.Vector3 ? target : target.position;
-    from.lookAt(p);
+    const savedPos = from.position.clone();
+    const worldPos = new THREE.Vector3();
+    from.getWorldPosition(worldPos);
+    const m = new THREE.Matrix4();
+    if (cameraObject && from === objects.get(cameraObject)) {
+      m.lookAt(worldPos, p, from.up);
+    } else {
+      m.lookAt(p, worldPos, from.up);
+    }
+    from.quaternion.setFromRotationMatrix(m);
+    from.rotation.setFromQuaternion(from.quaternion);
+    from.position.copy(savedPos);
   };
 
-  // [FIX] 描画ループの開始関数（二重起動防止）
+  function updatePhysics(delta) {
+    if (delta <= 0) return;
+    for (const moving of objects.values()) {
+      if (!moving.userData.physics) continue;
+      moving.userData.velocityY = (moving.userData.velocityY || 0) + GRAVITY * delta;
+      moving.position.y += moving.userData.velocityY * delta;
+      if (moving.userData.passThrough) continue;
+      let movingBox = box(moving);
+      for (const other of objects.values()) {
+        if (other === moving || other.userData.passThrough) continue;
+        const otherBox = box(other);
+        if (!movingBox.intersectsBox(otherBox)) continue;
+        if (moving.userData.velocityY <= 0) moving.position.y += otherBox.max.y - movingBox.min.y;
+        else moving.position.y -= movingBox.max.y - otherBox.min.y;
+        moving.userData.velocityY = 0;
+        movingBox = box(moving);
+      }
+    }
+  }
+
   function startRenderLoop() {
     if (loopRunning) return;
     loopRunning = true;
@@ -178,12 +246,13 @@
   }
 
   function renderLoop() {
-    // [FIX] ループ停止時は即座に脱出
     if (!loopRunning) return;
     frame = requestAnimationFrame(renderLoop);
     if (!drawing) return;
-    // [FIX] コンテキスト喪失中は描画をスキップ
     if (contextLost) return;
+    const delta = Math.min(_physicsClock.getDelta(), 0.05);
+    updatePhysics(delta);
+    for (const o of objects.values()) if (o.userData.animationMixer) o.userData.animationMixer.update(delta);
     const size = renderer.getNativeSize();
     if (canvas.width !== size[0] || canvas.height !== size[1]) {
       glRenderer.setSize(size[0], size[1], false);
@@ -205,7 +274,6 @@
     if (skin) skin.update();
     runtime.requestRedraw();
   }
-  // [FIX] renderLoop() → startRenderLoop() に変更
   startRenderLoop();
 
   class BackLayer3D {
@@ -217,7 +285,10 @@
         {opcode:"create", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を作成する", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"textureCostume", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のテクスチャを [COSTUME] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},COSTUME:{type:S,defaultValue:"costume1"}}},
         {opcode:"textureURL", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のテクスチャをURL [URL] から読み込む", arguments:{NAME:{type:S,defaultValue:"box"},URL:{type:S,defaultValue:"https://example.com/test.png"}}},
-        {opcode:"modelList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のモデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
+        {opcode:"modelOBJList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のobjモデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
+        {opcode:"modelGLTFList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の(gltf/glb)モデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
+        {opcode:"playAnimation", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] にアニメーション [ANIMATION] を再生する", arguments:{NAME:{type:S,defaultValue:"box"},ANIMATION:{type:S,defaultValue:"Animation"}}},
+        {opcode:"playAnimationUntilDone", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] にアニメーション [ANIMATION] を終わるまで再生する", arguments:{NAME:{type:S,defaultValue:"box"},ANIMATION:{type:S,defaultValue:"Animation"}}},
         {opcode:"remove", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を削除する", arguments:{NAME:{type:S,defaultValue:"box"}}},
         "---",
         {opcode:"setPosition", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の位置を x [X] y [Y] z [Z] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},X:{type:N,defaultValue:0},Y:{type:N,defaultValue:0},Z:{type:N,defaultValue:0}}},
@@ -234,6 +305,9 @@
         {opcode:"changeRotationX", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを x [VALUE] ずつ変える", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
         {opcode:"changeRotationY", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを y [VALUE] ずつ変える", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
         {opcode:"changeRotationZ", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを z [VALUE] ずつ変える", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
+        {opcode:"changeRotationXWorld", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを x [VALUE] ずつ変える しかしオブジェクトが向いてる方向ではない", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
+        {opcode:"changeRotationYWorld", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを y [VALUE] ずつ変える しかしオブジェクトが向いてる方向ではない", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
+        {opcode:"changeRotationZWorld", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の向きを z [VALUE] ずつ変える しかしオブジェクトが向いてる方向ではない", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
         {opcode:"setScale", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の大きさを x [X] y [Y] z [Z] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},X:{type:N,defaultValue:100},Y:{type:N,defaultValue:100},Z:{type:N,defaultValue:100}}},
         {opcode:"setScaleX", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の大きさを x [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:100}}},
         {opcode:"setScaleY", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の大きさを y [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:100}}},
@@ -251,6 +325,7 @@
         {opcode:"setColor", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の色を [COLOR] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},COLOR:{type:C,defaultValue:"#ffffff"}}},
         {opcode:"setOpacity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の透明度を [VALUE] % にする", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:0}}},
         {opcode:"setPassThrough", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の貫通を [STATE] にする", arguments:{NAME:{type:S,defaultValue:"box"},STATE:{type:S,menu:"onoff"}}},
+        {opcode:"setPhysics", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のphysicsを [STATE] にする", arguments:{NAME:{type:S,defaultValue:"box"},STATE:{type:S,menu:"onoff"}}},
         {opcode:"bounce", blockType:BlockType.COMMAND, text:"もしオブジェクト [NAME] が他のオブジェクトに触れたら跳ね返る", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"isTouching", blockType:BlockType.BOOLEAN, text:"オブジェクト [NAME] がオブジェクト [TARGET] に触れた", arguments:{NAME:{type:S,defaultValue:"box"},TARGET:{type:S,defaultValue:"target"}}},
         "---",
@@ -265,6 +340,7 @@
         {opcode:"setLightIntensity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},VALUE:{type:N,defaultValue:10}}},
         {opcode:"setLightColor", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の色を [COLOR] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},COLOR:{type:C,defaultValue:"#ffffff"}}},
         {opcode:"setReflectivity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の反射の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:1}}},
+        {opcode:"setRTXShadows", blockType:BlockType.COMMAND, text:"高度な影RTXを [STATE] にする", arguments:{STATE:{type:S,menu:"onoff"}}},
         "---",
         {opcode:"getPositionX", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の x の位置", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getPositionY", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の y の位置", arguments:{NAME:{type:S,defaultValue:"box"}}},
@@ -279,7 +355,7 @@
       ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff}};
     }
 
-    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())scene.remove(l); lights.clear(); cameraObject=null; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
+    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())scene.remove(l); lights.clear(); cameraObject=null; rtxShadows=false; glRenderer.shadowMap.type=THREE.PCFShadowMap; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
     create(a){makeObject(name(a.NAME));}
     remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}
     setPosition(a){const o=object(a.NAME);if(o)o.position.set(num(a.X),num(a.Y),num(a.Z));}
@@ -293,9 +369,16 @@
     setRotationX(a){const o=object(a.NAME);if(o)o.rotation.x=THREE.MathUtils.degToRad(num(a.VALUE));}
     setRotationY(a){const o=object(a.NAME);if(o)o.rotation.y=THREE.MathUtils.degToRad(num(a.VALUE));}
     setRotationZ(a){const o=object(a.NAME);if(o)o.rotation.z=THREE.MathUtils.degToRad(num(a.VALUE));}
-    changeRotationX(a){const o=object(a.NAME);if(o)o.rotation.x+=THREE.MathUtils.degToRad(num(a.VALUE));}
-    changeRotationY(a){const o=object(a.NAME);if(o)o.rotation.y+=THREE.MathUtils.degToRad(num(a.VALUE));}
-    changeRotationZ(a){const o=object(a.NAME);if(o)o.rotation.z+=THREE.MathUtils.degToRad(num(a.VALUE));}
+    // [FIX v1.2.1] ローカル軸回転: オブジェクトの向き基準で回転する
+    //   Before: o.rotation.x += deg (ワールド軸の Euler 回転 → オブジェクトが向いてる方向と無関係)
+    //   After:  quaternion.multiply(deltaQuat on local axis) → オブジェクトのローカル軸で回転
+    changeRotationX(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisX,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    changeRotationY(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisY,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    changeRotationZ(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisZ,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    // ワールド軸回転（オブジェクト自身の向きに影響されない）
+    changeRotationXWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisX,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    changeRotationYWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisY,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
+    changeRotationZWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisZ,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
     setScale(a){const o=object(a.NAME);if(o)o.scale.set(num(a.X)/100,num(a.Y)/100,num(a.Z)/100);}
     setScaleX(a){const o=object(a.NAME);if(o)o.scale.x=num(a.VALUE)/100;}
     setScaleY(a){const o=object(a.NAME);if(o)o.scale.y=num(a.VALUE)/100;}
@@ -312,6 +395,7 @@
     setColor(a){const o=object(a.NAME);if(o)setMaterial(o,m=>m.color&&m.color.set(color(a.COLOR)));}
     setOpacity(a){const o=object(a.NAME),opacity=THREE.MathUtils.clamp(1-num(a.VALUE)/100,0,1);if(o)setMaterial(o,m=>{m.transparent=opacity<1;m.opacity=opacity;m.needsUpdate=true;});}
     setPassThrough(a){const o=object(a.NAME);if(o)o.userData.passThrough=name(a.STATE)==="on";}
+    setPhysics(a){const o=object(a.NAME);if(o){o.userData.physics=name(a.STATE)==="on";if(!o.userData.physics)o.userData.velocityY=0;}}
     isTouching(a){return touching(object(a.NAME),object(a.TARGET));}
     bounce(a){const o=object(a.NAME);if(!o||o.userData.passThrough)return;for(const other of objects.values()){if(other!==o&&touching(o,other)){const delta=o.position.clone().sub(other.position);if(Math.abs(delta.x)>=Math.abs(delta.y)&&Math.abs(delta.x)>=Math.abs(delta.z))o.position.x+=Math.sign(delta.x||1)*0.2;else if(Math.abs(delta.y)>=Math.abs(delta.z))o.position.y+=Math.sign(delta.y||1)*0.2;else o.position.z+=Math.sign(delta.z||1)*0.2;break;}}}
     start(){drawing=true;}
@@ -320,10 +404,11 @@
     setFogDistance(a){fogDistance=num(a.VALUE);updateFog();}
     setFogColor(a){fogColor=color(a.COLOR);updateFog();}
     setFog(a){fogEnabled=name(a.STATE)==="on";updateFog();}
-    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=new THREE.PointLight(0xffffff,10,100);lights.set(n,l);scene.add(l);}o.getWorldPosition(l.position);}else{const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}}
+    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=new THREE.PointLight(0xffffff,10,100);lights.set(n,l);scene.add(l);}l.castShadow=rtxShadows;o.getWorldPosition(l.position);}else{const l=lights.get(n);if(l){scene.remove(l);lights.delete(n);}}}
     setLightIntensity(a){const l=lights.get(name(a.NAME));if(l)l.intensity=num(a.VALUE);}
     setLightColor(a){const l=lights.get(name(a.NAME));if(l)l.color.set(color(a.COLOR));}
     setReflectivity(a){const o=object(a.NAME),v=THREE.MathUtils.clamp(num(a.VALUE),0,1);if(o)setMaterial(o,m=>{if("metalness" in m)m.metalness=v;if("roughness" in m)m.roughness=1-v;m.needsUpdate=true;});}
+    setRTXShadows(a){rtxShadows=name(a.STATE)==="on";glRenderer.shadowMap.type=rtxShadows?THREE.PCFSoftShadowMap:THREE.PCFShadowMap;glRenderer.shadowMap.needsUpdate=true;applyRTXToAll();}
     getPositionX(a){const o=object(a.NAME);return o?o.position.x:0;}
     getPositionY(a){const o=object(a.NAME);return o?o.position.y:0;}
     getPositionZ(a){const o=object(a.NAME);return o?o.position.z:0;}
@@ -335,23 +420,22 @@
     getScaleZ(a){const o=object(a.NAME);return o?o.scale.z*100:0;}
     distance(a){const o=object(a.NAME),t=object(a.TARGET);return o&&t?o.position.distanceTo(t.position):0;}
 
-    async textureCostume(a,util){const o=object(a.NAME);if(!o)return;const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.needsUpdate=true;});}
-    async textureURL(a){const o=object(a.NAME);if(!o)return;const url=name(a.URL);if(!await Scratch.canFetch(url))return;const response=await Scratch.fetch(url);const blob=await response.blob();const local=URL.createObjectURL(blob);try{const texture=await new THREE.TextureLoader().loadAsync(local);texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.needsUpdate=true;});}finally{URL.revokeObjectURL(local);}}
-    async modelList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;let root;if(items.every(v=>Number.isFinite(Number(v))&&Number(v)>=0&&Number(v)<=255)){const bytes=new Uint8Array(items.map(Number));const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(bytes.buffer,"",resolve,reject));root=gltf.scene;}else{const text=items.join("\n").trim();if(text.startsWith("{")||text.startsWith("[")){const gltf=await new Promise((resolve,reject)=>new GLTFLoader().parse(text,"",resolve,reject));root=gltf.scene;}else root=new OBJLoader().parse(text);}replaceObject(n,root);}
+    async textureCostume(a,util){const o=object(a.NAME);if(!o)return;const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.transparent=true;m.depthWrite=false;m.needsUpdate=true;});}
+    async textureURL(a){const o=object(a.NAME);if(!o)return;const url=name(a.URL);if(!await Scratch.canFetch(url))return;const response=await Scratch.fetch(url);const blob=await response.blob();const local=URL.createObjectURL(blob);try{const texture=await new THREE.TextureLoader().loadAsync(local);texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.transparent=true;m.depthWrite=false;m.needsUpdate=true;});}finally{URL.revokeObjectURL(local);}}
+    modelOBJList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;replaceObject(n,new OBJLoader().parse(items.join("\n")));}
+    async modelGLTFList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;replaceObject(n,await loadGLTFList(items));}
+    playAnimation(a){playObjectAnimation(object(a.NAME),a.ANIMATION);}
+    playAnimationUntilDone(a,util){const o=object(a.NAME);if(!o)return;if(!util.stackFrame.action){const action=playObjectAnimation(o,a.ANIMATION);if(!action)return;util.stackFrame.action=action;}if(util.stackFrame.action.isRunning())util.yield();}
   }
 
-  // [FIX] PROJECT_STOP_ALL: 描画停止＋スキンクリア（変更なし）
   runtime.on("PROJECT_STOP_ALL", () => { drawing = false; clearSkin(); });
 
-  // [FIX] PROJECT_LOADED: バックレイヤー再インストール ＋ 描画ループ再開
   runtime.on("PROJECT_LOADED", () => {
     drawing = false;
     installBackLayer();
     startRenderLoop();
   });
 
-  // [FIX] RUNTIME_DISPOSED: glRenderer.dispose() と cancelAnimationFrame を削除
-  //   → プロジェクト再読み込み時にレンダラーと描画ループが生き続ける
   runtime.on("RUNTIME_DISPOSED", () => {
     drawing = false;
     clearSkin();

@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.4.1
+// Version: 1.6.1
 
 (async function (Scratch) {
   "use strict";
@@ -67,6 +67,122 @@
   let drawableId = null;
   let skinId = null;
   let rtxShadows = false;
+  let materialBaseURL = "https://data.nofileteams.com/templeate/";
+  let materialNames = [];
+
+  const normalizeBaseURL = value => {
+    const url = name(value).trim();
+    return url.endsWith("/") ? url : url + "/";
+  };
+  const loadTextureFromURL = async url => {
+    if (!await Scratch.canFetch(url)) return null;
+    const response = await Scratch.fetch(url);
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    const local = URL.createObjectURL(blob);
+    try {
+      const texture = await new THREE.TextureLoader().loadAsync(local);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      return texture;
+    } finally { URL.revokeObjectURL(local); }
+  };
+  const refreshMaterialList = async () => {
+    try {
+      const url = materialBaseURL + "list.txt";
+      if (!await Scratch.canFetch(url)) return;
+      const response = await Scratch.fetch(url);
+      if (!response.ok) return;
+      materialNames = (await response.text()).split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+    } catch (error) { console.warn("BackLayer 3D: 素材一覧を取得できませんでした", error); }
+  };
+  const markTiling = texture => { texture.wrapS=THREE.RepeatWrapping; texture.wrapT=THREE.RepeatWrapping; texture.userData=texture.userData||{}; texture.userData.tile=true; return texture; };
+  const updateTilingRepeat = root => {
+    // [FIX v1.6.1] 面ごとにUVを再計算して、画像(100x100)が各面の実寸に合わせてタイルされるようにする。
+    //   Before: texture.repeat を bounding-box の size.x/size.y で一律設定 → 面によって伸縮/縦長化
+    //   After:  BoxGeometry の6面それぞれの UV に面ごとのワールド寸法を baked → 面ごとに正しくタイル
+    const texture = root.userData.materialTexture;
+    if (!texture || !texture.userData || !texture.userData.tile) return;
+    let usedUV = false;
+    allMeshes(root).forEach(mesh => {
+      const geo = mesh.geometry;
+      if (!geo || !geo.attributes || !geo.attributes.uv) return;
+      const isBox = geo.type === "BoxGeometry" || (geo.parameters && geo.parameters.width !== undefined && geo.parameters.height !== undefined);
+      if (!isBox) return;
+      usedUV = true;
+      if (!geo.userData._origUV) geo.userData._origUV = Float32Array.from(geo.attributes.uv.array);
+      const orig = geo.userData._origUV;
+      const sx = mesh.scale.x, sy = mesh.scale.y, sz = mesh.scale.z;
+      const w = geo.parameters.width || 1, h = geo.parameters.height || 1, d = geo.parameters.depth || 1;
+      // three.js BoxGeometry の面順: +X,-X,+Y,-Y,+Z,-Z (各4頂点)
+      // 各面の (U方向, V方向) のワールドサイズ (画像1枚 = 1ワールド単位 = 100スケール)
+      const faces = [
+        [sz * d, sy * h], [sz * d, sy * h], // ±X: U=Z(depth), V=Y(height)
+        [sx * w, sz * d], [sx * w, sz * d], // ±Y: U=X(width),  V=Z(depth)
+        [sx * w, sy * h], [sx * w, sy * h]  // ±Z: U=X(width),  V=Y(height)
+      ];
+      const arr = geo.attributes.uv.array;
+      for (let f = 0; f < 6; f++) {
+        const ru = Math.max(0.01, faces[f][0]);
+        const rv = Math.max(0.01, faces[f][1]);
+        for (let v = 0; v < 4; v++) {
+          const idx = f * 4 + v;
+          arr[idx * 2]     = orig[idx * 2]     * ru;
+          arr[idx * 2 + 1] = orig[idx * 2 + 1] * rv;
+        }
+      }
+      geo.attributes.uv.needsUpdate = true;
+    });
+    if (usedUV) {
+      // UVに焼き込んだので repeat は 1:1 に戻す
+      texture.repeat.set(1, 1);
+    } else {
+      // Box以外(OBJ/GLTF)は従来の repeat 方式をフォールバック
+      const size = box(root).getSize(new THREE.Vector3());
+      texture.repeat.set(Math.max(0.01, size.x), Math.max(0.01, size.y));
+    }
+    texture.needsUpdate = true;
+  };
+  let materialLoadMethod = "毎回urlから読み込む";
+  let preloadingMaterials = false;
+  const openMaterialDB = () => new Promise((resolve, reject) => {
+    const req = indexedDB.open("backlayer3d_materials", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("materials");
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  const getCachedBlob = async material => {
+    try { const db = await openMaterialDB(); return await new Promise((resolve, reject) => { const tx = db.transaction("materials","readonly"); const req = tx.objectStore("materials").get(material); req.onsuccess = () => resolve(req.result || null); req.onerror = () => reject(req.error); }); } catch (error) { return null; }
+  };
+  const setCachedBlob = async (material, blob) => {
+    try { const db = await openMaterialDB(); await new Promise((resolve, reject) => { const tx = db.transaction("materials","readwrite"); tx.objectStore("materials").put(blob, material); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error); }); } catch (error) {}
+  };
+  const blobToTexture = async blob => {
+    const local = URL.createObjectURL(blob);
+    try { const texture = await new THREE.TextureLoader().loadAsync(local); texture.colorSpace = THREE.SRGBColorSpace; return texture; } finally { URL.revokeObjectURL(local); }
+  };
+  const preloadAllMaterials = async () => {
+    if (preloadingMaterials) return;
+    preloadingMaterials = true;
+    try {
+      await refreshMaterialList();
+      for (const material of materialNames) {
+        const cached = await getCachedBlob(material);
+        if (cached) continue;
+        const url = materialBaseURL + encodeURIComponent(material) + ".png";
+        if (!await Scratch.canFetch(url)) continue;
+        const response = await Scratch.fetch(url);
+        if (!response.ok) continue;
+        await setCachedBlob(material, await response.blob());
+      }
+    } catch (error) { console.warn("BackLayer 3D: 素材の事前ダウンロードに失敗", error); }
+    finally { preloadingMaterials = false; }
+  };
+  const applyPreferredTexture = root => {
+    const override = Boolean(root.userData.textureOverride);
+    const texture = root.userData.textureOverride || root.userData.materialTexture || null;
+    setMaterial(root, m => { m.map=texture; m.transparent=Boolean(texture); m.depthWrite=!texture; m.needsUpdate=true; });
+    if (!override) updateTilingRepeat(root);
+  };
 
   // [FIX] Reusable scratch objects to avoid per-call allocation
   const _localAxisX = new THREE.Vector3(1, 0, 0);
@@ -164,6 +280,8 @@
     mesh.userData.physics = false;
     mesh.userData.velocityY = 0;
     mesh.userData.lightType = "全体";
+    mesh.userData.materialTexture = null;
+    mesh.userData.textureOverride = null;
     mesh.castShadow = rtxShadows; mesh.receiveShadow = rtxShadows;
     scene.add(mesh); objects.set(n, mesh);
     return mesh;
@@ -177,7 +295,10 @@
     next.userData.physics = old.userData.physics || false;
     next.userData.velocityY = old.userData.velocityY || 0;
     next.userData.lightType = old.userData.lightType || "全体";
+    next.userData.materialTexture = old.userData.materialTexture || null;
+    next.userData.textureOverride = old.userData.textureOverride || null;
     applyRTXToObject(next);
+    applyPreferredTexture(next);
     scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
   const disposeObject = root => {
@@ -359,6 +480,7 @@
       const sourceObject = objects.get(lightName);
       if (sourceObject) syncLight(sourceObject, light);
     }
+    for (const o of objects.values()){const t=o.userData.materialTexture;if(t&&t.userData&&t.userData.tile){const s=o.scale;if(o.userData.lastTileX!==s.x||o.userData.lastTileY!==s.y||o.userData.lastTileZ!==s.z){updateTilingRepeat(o);o.userData.lastTileX=s.x;o.userData.lastTileY=s.y;o.userData.lastTileZ=s.z;}}}
     glRenderer.render(scene, camera);
     const skin = renderer._allSkins[skinId];
     if (skin) skin.update();
@@ -371,11 +493,17 @@
       const S = ArgumentType.STRING, N = ArgumentType.NUMBER, C = ArgumentType.COLOR;
       const onoff = {acceptReporters:true, items:["on","off"]};
       const lighttype = {acceptReporters:true, items:["全体","向いてる方向"]};
+      const materials = {acceptReporters:true, items:"getMaterialMenu"};
+      const materialLoadMethod = {acceptReporters:true, items:["事前に素材の画像をダウンロードする","毎回urlから読み込む"]};
       return {id:"backlayer3d", name:"BackLayer 3D", color1:"#5B5FEF", color2:"#4549C4", blocks:[
         {opcode:"reset", blockType:BlockType.COMMAND, text:"reset all"},
         {opcode:"create", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を作成する", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"textureCostume", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のテクスチャを [COSTUME] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},COSTUME:{type:S,defaultValue:"costume1"}}},
         {opcode:"textureURL", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のテクスチャをURL [URL] から読み込む", arguments:{NAME:{type:S,defaultValue:"box"},URL:{type:S,defaultValue:"https://example.com/test.png"}}},
+        {opcode:"setObjectMaterial", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の素材を [MATERIAL] にする", arguments:{NAME:{type:S,defaultValue:"box"},MATERIAL:{type:S,menu:"materials"}}},
+        {opcode:"removeTexture", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のテクスチャを削除する", arguments:{NAME:{type:S,defaultValue:"box"}}},
+        {opcode:"setMaterialURL", blockType:BlockType.COMMAND, text:"素材のurlを [URL] に設定する", arguments:{URL:{type:S,defaultValue:"https://data.nofileteams.com/templeate/"}}},
+        {opcode:"setMaterialLoadMethod", blockType:BlockType.COMMAND, text:"素材の読み込み方法を [METHOD] に設定する", arguments:{METHOD:{type:S,menu:"materialLoadMethod"}}},
         {opcode:"modelOBJList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のobjモデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
         {opcode:"modelGLTFList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の(gltf/glb)モデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
         {opcode:"playAnimation", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] にアニメーション [ANIMATION] を再生する", arguments:{NAME:{type:S,defaultValue:"box"},ANIMATION:{type:S,defaultValue:"Animation"}}},
@@ -453,11 +581,16 @@
         {opcode:"getScaleY", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の y の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"getScaleZ", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] の z の大きさ", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"distance", blockType:BlockType.REPORTER, text:"オブジェクト [NAME] からオブジェクト [TARGET] までの距離", arguments:{NAME:{type:S,defaultValue:"box"},TARGET:{type:S,defaultValue:"target"}}}
-      ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff,lighttype}};
+      ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff,lighttype,materials,materialLoadMethod}};
     }
 
     reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; rtxShadows=false; glRenderer.shadowMap.type=THREE.PCFShadowMap; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
+    getMaterialMenu(){return materialNames.length ? materialNames : ["(素材なし)"];}
     create(a){makeObject(name(a.NAME));}
+    async setMaterialURL(a){materialBaseURL=normalizeBaseURL(a.URL);await refreshMaterialList();if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();}
+    async setObjectMaterial(a){const o=object(a.NAME),material=name(a.MATERIAL);if(!o||!materialNames.includes(material))return;let texture;if(materialLoadMethod==="事前に素材の画像をダウンロードする"){let blob=await getCachedBlob(material);if(!blob){const url=materialBaseURL+encodeURIComponent(material)+".png";if(await Scratch.canFetch(url)){const response=await Scratch.fetch(url);if(response.ok){blob=await response.blob();await setCachedBlob(material,blob);}}}if(!blob)return;texture=await blobToTexture(blob);}else{texture=await loadTextureFromURL(materialBaseURL+encodeURIComponent(material)+".png");}if(!texture)return;markTiling(texture);o.userData.materialTexture=texture;applyPreferredTexture(o);updateTilingRepeat(o);}
+    async setMaterialLoadMethod(a){materialLoadMethod=name(a.METHOD);if(materialLoadMethod==="事前に素材の画像をダウンロードする")await preloadAllMaterials();}
+    removeTexture(a){const o=object(a.NAME);if(!o)return;const texture=o.userData.textureOverride;o.userData.textureOverride=null;applyPreferredTexture(o);if(texture&&texture!==o.userData.materialTexture)texture.dispose();}
     remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}
     setPosition(a){const o=object(a.NAME);if(o)o.position.set(num(a.X),num(a.Y),num(a.Z));}
     setPositionX(a){const o=object(a.NAME);if(o)o.position.x=num(a.VALUE);}
@@ -543,8 +676,8 @@
     getScaleZ(a){const o=object(a.NAME);return o?o.scale.z*100:0;}
     distance(a){const o=object(a.NAME),t=object(a.TARGET);return o&&t?o.position.distanceTo(t.position):0;}
 
-    async textureCostume(a,util){const o=object(a.NAME);if(!o)return;const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.transparent=true;m.depthWrite=false;m.needsUpdate=true;});}
-    async textureURL(a){const o=object(a.NAME);if(!o)return;const url=name(a.URL);if(!await Scratch.canFetch(url))return;const response=await Scratch.fetch(url);const blob=await response.blob();const local=URL.createObjectURL(blob);try{const texture=await new THREE.TextureLoader().loadAsync(local);texture.colorSpace=THREE.SRGBColorSpace;setMaterial(o,m=>{m.map=texture;m.transparent=true;m.depthWrite=false;m.needsUpdate=true;});}finally{URL.revokeObjectURL(local);}}
+    async textureCostume(a,util){const o=object(a.NAME);if(!o)return;const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;o.userData.textureOverride=texture;applyPreferredTexture(o);}
+    async textureURL(a){const o=object(a.NAME);if(!o)return;const texture=await loadTextureFromURL(name(a.URL));if(!texture)return;o.userData.textureOverride=texture;applyPreferredTexture(o);}
     modelOBJList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;replaceObject(n,new OBJLoader().parse(items.join("\n")));}
     async modelGLTFList(a,util){const n=name(a.NAME),items=listValue(a.LIST,util);if(!objects.has(n)||!items.length)return;replaceObject(n,await loadGLTFList(items));}
     playAnimation(a){playObjectAnimation(object(a.NAME),a.ANIMATION);}
@@ -553,7 +686,10 @@
 
   runtime.on("PROJECT_STOP_ALL", () => { drawing = false; clearSkin(); });
 
-  runtime.on("PROJECT_LOADED", () => {
+  runtime.on("PROJECT_LOADED", async () => {
+    await refreshMaterialList();
+    if(materialLoadMethod==="事前に素材の画像をダウンロードする")preloadAllMaterials();
+    if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();
     drawing = false;
     installBackLayer();
     startRenderLoop();
@@ -564,5 +700,6 @@
     clearSkin();
   });
 
+  await refreshMaterialList();
   Scratch.extensions.register(new BackLayer3D());
 })(Scratch);

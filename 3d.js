@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.6.3
+// Version: 1.6.5
 
 (async function (Scratch) {
   "use strict";
@@ -433,13 +433,31 @@
     const sz = box.getSize(new THREE.Vector3());
     const ctr = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(sz.x, sz.z, 10);
-    shadowCamera.left = -maxDim;
-    shadowCamera.right = maxDim;
-    shadowCamera.top = maxDim;
-    shadowCamera.bottom = -maxDim;
-    shadowCamera.near = 0.1;
-    shadowCamera.far = maxDim * 4 + sz.y + 100;
-    shadowCamera.position.set(ctr.x, box.max.y + maxDim * 2, ctr.z);
+    // 光源の位置を取得（最初のライト）。光源があればそこから影を落とす
+    let lightPos = null;
+    for (const [lightName] of lights) {
+      const src = objects.get(lightName);
+      if (src) { lightPos = new THREE.Vector3(); src.getWorldPosition(lightPos); break; }
+    }
+    if (lightPos) {
+      const dist = lightPos.distanceTo(ctr);
+      const frust = Math.max(maxDim * 1.6, 15);
+      shadowCamera.left = -frust;
+      shadowCamera.right = frust;
+      shadowCamera.top = frust;
+      shadowCamera.bottom = -frust;
+      shadowCamera.near = 0.1;
+      shadowCamera.far = dist + sz.length() / 2 + 100;
+      shadowCamera.position.copy(lightPos);
+    } else {
+      shadowCamera.left = -maxDim;
+      shadowCamera.right = maxDim;
+      shadowCamera.top = maxDim;
+      shadowCamera.bottom = -maxDim;
+      shadowCamera.near = 0.1;
+      shadowCamera.far = maxDim * 4 + sz.y + 100;
+      shadowCamera.position.set(ctr.x, box.max.y + maxDim * 2, ctr.z);
+    }
     shadowCamera.lookAt(ctr);
     shadowCamera.updateMatrixWorld();
     shadowCamera.updateProjectionMatrix();
@@ -447,8 +465,9 @@
     shadowMatrix.multiplyMatrices(shadowMatrix, shadowCamera.matrixWorldInverse);
     shadowMaterial.uniforms.uNear.value = shadowCamera.near;
     shadowMaterial.uniforms.uFar.value = shadowCamera.far;
-    const passThroughs = [];
-    for (const o of objects.values()) { if (o.userData.passThrough) { passThroughs.push(o); o.visible = false; } }
+    const hiddenObjs = [];
+    for (const o of objects.values()) { if (o.userData.passThrough) { hiddenObjs.push(o); o.visible = false; } }
+    for (const [lightName] of lights) { const src = objects.get(lightName); if (src && src.visible) { hiddenObjs.push(src); src.visible = false; } }
     const skyVis = skyDome ? skyDome.visible : null;
     if (skyDome) skyDome.visible = false;
     const oldOverride = scene.overrideMaterial;
@@ -459,7 +478,7 @@
     glRenderer.render(scene, shadowCamera);
     scene.overrideMaterial = oldOverride;
     glRenderer.setRenderTarget(oldT);
-    passThroughs.forEach(o => o.visible = true);
+    hiddenObjs.forEach(o => o.visible = true);
     if (skyDome) skyDome.visible = skyVis;
   };
   const patchShadowShader = (material) => {
@@ -475,7 +494,7 @@
       shader.vertexShader = "varying vec3 vWorldPos;\n" + shader.vertexShader;
       shader.vertexShader = shader.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n  vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;");
       shader.fragmentShader = "varying vec3 vWorldPos;\nuniform sampler2D shadowMap;\nuniform mat4 shadowMatrix;\nuniform float shadowsEnabled;\n" + shader.fragmentShader;
-      shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", "#include <color_fragment>\n  if (shadowsEnabled > 0.5) {\n    vec4 sCoord = shadowMatrix * vec4(vWorldPos, 1.0);\n    sCoord.xyz /= sCoord.w;\n    if (sCoord.x >= 0.0 && sCoord.x <= 1.0 && sCoord.y >= 0.0 && sCoord.y <= 1.0 && sCoord.z >= 0.0 && sCoord.z <= 1.0) {\n      float sDepth = texture2D(shadowMap, sCoord.xy).r;\n      if (sCoord.z > sDepth + 0.003) diffuseColor.rgb *= 0.5;\n    }\n  }\n");
+      shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", "#include <color_fragment>\n  if (shadowsEnabled > 0.5) {\n    vec4 sCoord = shadowMatrix * vec4(vWorldPos, 1.0);\n    sCoord.xyz /= sCoord.w;\n    if (sCoord.x >= 0.0 && sCoord.x <= 1.0 && sCoord.y >= 0.0 && sCoord.y <= 1.0 && sCoord.z >= 0.0 && sCoord.z <= 1.0) {\n      float shadow = 0.0;\n      float texelSize = 1.5 / 2048.0;\n      for (int x = -2; x <= 2; x++) {\n        for (int y = -2; y <= 2; y++) {\n          vec2 offset = vec2(float(x), float(y)) * texelSize;\n          float sDepth = texture2D(shadowMap, sCoord.xy + offset).r;\n          shadow += (sCoord.z > sDepth + 0.003) ? 1.0 : 0.0;\n        }\n      }\n      shadow /= 25.0;\n      diffuseColor.rgb *= 1.0 - shadow * 0.5;\n    }\n  }\n");
     };
     material.needsUpdate = true;
   };

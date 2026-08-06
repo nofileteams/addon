@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.6.5
+// Version: 1.6.6
 
 (async function (Scratch) {
   "use strict";
@@ -59,7 +59,16 @@
   let shadowsEnabled = false;
   let shadowUpdateCounter = 0;
   const shadowMapSize = 2048;
-  const shadowTarget = new THREE.WebGLRenderTarget(shadowMapSize, shadowMapSize);
+  // [FIX v1.6.6] 深度テクスチャを既定の8bit(UnsignedByteType)から16bit浮動小数点(HalfFloatType)に変更。
+  //   8bitだと深度が256段階にしか量子化されず、壁のような緩やかな傾斜面で「等高線」状の
+  //   段差(=不自然な一直線の影)が出ていた。HalfFloatにすることで滑らかな深度勾配になる。
+  const shadowTarget = new THREE.WebGLRenderTarget(shadowMapSize, shadowMapSize, {
+    type: THREE.HalfFloatType,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    generateMipmaps: false,
+    depthBuffer: true
+  });
   const shadowMaterial = new THREE.ShaderMaterial({
     vertexShader: "varying float vDepth;void main(){vec4 mv=modelViewMatrix*vec4(position,1.0);vDepth=-mv.z;gl_Position=projectionMatrix*mv;}",
     fragmentShader: "varying float vDepth;uniform float uNear;uniform float uFar;void main(){float d=(vDepth-uNear)/(uFar-uNear);gl_FragColor=vec4(d,d,d,1.0);}",
@@ -69,7 +78,16 @@
   const shadowBiasMatrix = new THREE.Matrix4();
   shadowBiasMatrix.set(0.5, 0.0, 0.0, 0.5, 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0);
   const shadowMatrix = new THREE.Matrix4();
-  const shadowUniforms = { shadowMap: { value: shadowTarget.texture }, shadowMatrix: { value: shadowMatrix }, shadowsEnabled: { value: 0.0 } };
+  // [FIX v1.6.6] 追加uniform: ライト方向・法線バイアス量・シャドウマップ1テクセルのワールドサイズ。
+  //   これらを使ってスロープスケール法線オフセットバイアスを行い、壁のシャドウアクネ(ギザギザの影)と
+  //   ボックス背後の影の浮き/めり込みを両方解消する。
+  const shadowUniforms = {
+    shadowMap: { value: shadowTarget.texture },
+    shadowMatrix: { value: shadowMatrix },
+    shadowsEnabled: { value: 0.0 },
+    shadowLightDir: { value: new THREE.Vector3(0, -1, 0) },
+    shadowTexelSize: { value: 0.05 }
+  };
   const patchedMaterials = new WeakSet();
   let skyDome = null;
   let skyTexture = null;
@@ -201,6 +219,7 @@
   const _localAxisY = new THREE.Vector3(0, 1, 0);
   const _localAxisZ = new THREE.Vector3(0, 0, 1);
   const _deltaQuat = new THREE.Quaternion();
+  const _shadowLightDirTmp = new THREE.Vector3();
   const _physicsClock = new THREE.Clock();
   const GRAVITY = -9.8;
 
@@ -465,6 +484,11 @@
     shadowMatrix.multiplyMatrices(shadowMatrix, shadowCamera.matrixWorldInverse);
     shadowMaterial.uniforms.uNear.value = shadowCamera.near;
     shadowMaterial.uniforms.uFar.value = shadowCamera.far;
+    // [FIX v1.6.6] ライトの向き(影を落とす方向)とシャドウマップ1テクセルが表すワールド上の実寸を計算。
+    //   これをシェーダー側のスロープスケールバイアス/PCFサンプリング半径に使う。
+    shadowCamera.getWorldDirection(_shadowLightDirTmp);
+    shadowUniforms.shadowLightDir.value.copy(_shadowLightDirTmp);
+    shadowUniforms.shadowTexelSize.value = (shadowCamera.right - shadowCamera.left) / shadowMapSize;
     const hiddenObjs = [];
     for (const o of objects.values()) { if (o.userData.passThrough) { hiddenObjs.push(o); o.visible = false; } }
     for (const [lightName] of lights) { const src = objects.get(lightName); if (src && src.visible) { hiddenObjs.push(src); src.visible = false; } }
@@ -491,10 +515,81 @@
       shader.uniforms.shadowMap = shadowUniforms.shadowMap;
       shader.uniforms.shadowMatrix = shadowUniforms.shadowMatrix;
       shader.uniforms.shadowsEnabled = shadowUniforms.shadowsEnabled;
-      shader.vertexShader = "varying vec3 vWorldPos;\n" + shader.vertexShader;
-      shader.vertexShader = shader.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n  vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;");
-      shader.fragmentShader = "varying vec3 vWorldPos;\nuniform sampler2D shadowMap;\nuniform mat4 shadowMatrix;\nuniform float shadowsEnabled;\n" + shader.fragmentShader;
-      shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", "#include <color_fragment>\n  if (shadowsEnabled > 0.5) {\n    vec4 sCoord = shadowMatrix * vec4(vWorldPos, 1.0);\n    sCoord.xyz /= sCoord.w;\n    if (sCoord.x >= 0.0 && sCoord.x <= 1.0 && sCoord.y >= 0.0 && sCoord.y <= 1.0 && sCoord.z >= 0.0 && sCoord.z <= 1.0) {\n      float shadow = 0.0;\n      float texelSize = 1.5 / 2048.0;\n      for (int x = -2; x <= 2; x++) {\n        for (int y = -2; y <= 2; y++) {\n          vec2 offset = vec2(float(x), float(y)) * texelSize;\n          float sDepth = texture2D(shadowMap, sCoord.xy + offset).r;\n          shadow += (sCoord.z > sDepth + 0.003) ? 1.0 : 0.0;\n        }\n      }\n      shadow /= 25.0;\n      diffuseColor.rgb *= 1.0 - shadow * 0.5;\n    }\n  }\n");
+      shader.uniforms.shadowLightDir = shadowUniforms.shadowLightDir;
+      shader.uniforms.shadowTexelSize = shadowUniforms.shadowTexelSize;
+
+      // [FIX v1.6.6] ワールド法線(vWorldNormal)を追加で渡す。
+      //   これが無いと「面が光にほぼ平行(壁など)」な場所でバイアスが一律になり、
+      //   ギザギザのシャドウアクネ(画像内の稲妻状の影)が発生していた。
+      shader.vertexShader = "varying vec3 vWorldPos;\nvarying vec3 vWorldNormal;\n" + shader.vertexShader;
+      // 注意: three.jsの標準チャンク順序は #include<beginnormal_vertex> → #include<begin_vertex> の順で、
+      // どちらも void main(){...} の内側にある(#include<common> はmain()の外なので文を置けない)。
+      // 法線チャンクを持たないマテリアル(MeshBasicMaterial等)向けに、無い場合だけbegin_vertex側で既定値を入れる。
+      const hasNormalChunk = shader.vertexShader.includes("#include <beginnormal_vertex>");
+      shader.vertexShader = shader.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n  vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;" + (hasNormalChunk ? "" : "\n  vWorldNormal = vec3(0.0, 1.0, 0.0);"));
+      if (hasNormalChunk) {
+        shader.vertexShader = shader.vertexShader.replace("#include <beginnormal_vertex>", "#include <beginnormal_vertex>\n  vWorldNormal = normalize((modelMatrix * vec4(objectNormal, 0.0)).xyz);");
+      }
+
+      shader.fragmentShader = [
+        "varying vec3 vWorldPos;",
+        "varying vec3 vWorldNormal;",
+        "uniform sampler2D shadowMap;",
+        "uniform mat4 shadowMatrix;",
+        "uniform float shadowsEnabled;",
+        "uniform vec3 shadowLightDir;",
+        "uniform float shadowTexelSize;",
+        shader.fragmentShader
+      ].join("\n");
+
+      // 16方向のポアソンディスクオフセット。配列コンストラクタ(GLSL ES 3.00以降のみ)や
+      // 動的配列インデックスに依存すると環境によってコンパイルできない/遅いため、
+      // for文を使わず16サンプル分を展開(unroll)して確実に動くようにしている。
+      // フラグメントごとにこの円を回転させることで、固定グリッドPCFで出ていた
+      // 「格子状・一直線状」のアーティファクトを消し、影の濃淡の段階数も実質連続に近づける。
+      const poissonDisk = [
+        [-0.94201624, -0.39906216], [0.94558609, -0.76890725],
+        [-0.09418410, -0.92938870], [0.34495938, 0.29387760],
+        [-0.91588581, 0.45771432], [-0.81544232, -0.87912464],
+        [-0.38277543, 0.27676845], [0.97484398, 0.75648379],
+        [0.44323325, -0.97511554], [0.53742981, -0.47373420],
+        [-0.26496911, -0.41893023], [0.79197514, 0.19090188],
+        [-0.24188840, 0.99706507], [-0.81409955, 0.91437590],
+        [0.19984126, 0.78641367], [0.14383161, -0.14100790]
+      ];
+      const sampleLines = poissonDisk.map(([x, y]) =>
+        `      { vec2 sOff = sRot * vec2(${x}, ${y}) * sRadius; float sDepth = texture2D(shadowMap, sCoord.xy + sOff).r; float sDiff = sCoord.z - sDepth - sDepthBias; shadow += smoothstep(0.0, shadowTexelSize * 4.0, sDiff); }`
+      ).join("\n");
+
+      shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", [
+        "#include <color_fragment>",
+        "  if (shadowsEnabled > 0.5) {",
+        "    vec3 sNormal = normalize(vWorldNormal);",
+        // ライトに正対しているほどバイアスを小さく、かすめる角度(壁など)ほど大きくする
+        // スロープスケールバイアス。固定バイアスだけだと、正対面では浮き影(ボックス背後の不自然な隙間)、
+        // かすめ面ではアクネ(画像内の壁の稲妻状の影)のどちらかしか解消できなかった。
+        "    float sNdotL = clamp(dot(sNormal, -normalize(shadowLightDir)), 0.0, 1.0);",
+        "    float sSlope = clamp(1.0 - sNdotL, 0.0, 1.0);",
+        "    float sNormalBias = shadowTexelSize * (1.0 + sSlope * 6.0);",
+        "    float sDepthBias = mix(0.0006, 0.006, sSlope);",
+        "    vec3 sOffsetPos = vWorldPos + sNormal * sNormalBias;",
+        "    vec4 sCoord = shadowMatrix * vec4(sOffsetPos, 1.0);",
+        "    sCoord.xyz /= sCoord.w;",
+        "    if (sCoord.x >= 0.0 && sCoord.x <= 1.0 && sCoord.y >= 0.0 && sCoord.y <= 1.0 && sCoord.z >= 0.0 && sCoord.z <= 1.0) {",
+        // フラグメント位置から疑似乱数角度を作り、サンプル円を回転(=ディザリング)。バンディングや
+        // 目に見える一直線パターンを消し、なだらかな半影(ペナンブラ)にする。
+        "      float sAngle = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.28318530718;",
+        "      float sCa = cos(sAngle), sSa = sin(sAngle);",
+        "      mat2 sRot = mat2(sCa, -sSa, sSa, sCa);",
+        "      float sRadius = shadowTexelSize * 3.0;",
+        "      float shadow = 0.0;",
+        // 二値比較ではなくsmoothstepで各サンプルを連続値化 → 影の濃淡段階が16サンプル×連続値でなめらかに
+        sampleLines,
+        "      shadow /= 16.0;",
+        "      diffuseColor.rgb *= 1.0 - shadow * 0.65;",
+        "    }",
+        "  }"
+      ].join("\n"));
     };
     material.needsUpdate = true;
   };

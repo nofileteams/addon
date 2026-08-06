@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.6.1
+// Version: 1.6.3
 
 (async function (Scratch) {
   "use strict";
@@ -25,8 +25,6 @@
   glRenderer.setPixelRatio(1);
   glRenderer.setSize(480, 360, false);
   glRenderer.outputColorSpace = THREE.SRGBColorSpace;
-  glRenderer.shadowMap.enabled = true;
-  glRenderer.shadowMap.type = THREE.PCFShadowMap;
   glRenderer.setClearColor(0x000000, 0);
   glRenderer.autoClear = true;
 
@@ -58,6 +56,21 @@
   let fogHueEffect = 0;
   let fogBrightnessEffect = 0;
   let worldBrightness = 0.65;
+  let shadowsEnabled = false;
+  let shadowUpdateCounter = 0;
+  const shadowMapSize = 2048;
+  const shadowTarget = new THREE.WebGLRenderTarget(shadowMapSize, shadowMapSize);
+  const shadowMaterial = new THREE.ShaderMaterial({
+    vertexShader: "varying float vDepth;void main(){vec4 mv=modelViewMatrix*vec4(position,1.0);vDepth=-mv.z;gl_Position=projectionMatrix*mv;}",
+    fragmentShader: "varying float vDepth;uniform float uNear;uniform float uFar;void main(){float d=(vDepth-uNear)/(uFar-uNear);gl_FragColor=vec4(d,d,d,1.0);}",
+    uniforms: { uNear: { value: 0.1 }, uFar: { value: 500 } }
+  });
+  const shadowCamera = new THREE.OrthographicCamera(-50, 50, 50, -50, 0.1, 500);
+  const shadowBiasMatrix = new THREE.Matrix4();
+  shadowBiasMatrix.set(0.5, 0.0, 0.0, 0.5, 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0);
+  const shadowMatrix = new THREE.Matrix4();
+  const shadowUniforms = { shadowMap: { value: shadowTarget.texture }, shadowMatrix: { value: shadowMatrix }, shadowsEnabled: { value: 0.0 } };
+  const patchedMaterials = new WeakSet();
   let skyDome = null;
   let skyTexture = null;
   let skyEffectTexture = null;
@@ -66,7 +79,6 @@
   let cameraObject = null;
   let drawableId = null;
   let skinId = null;
-  let rtxShadows = false;
   let materialBaseURL = "https://data.nofileteams.com/templeate/";
   let materialNames = [];
 
@@ -266,11 +278,6 @@
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materials.forEach(fn);
   });
-  const applyRTXToObject = root => allMeshes(root).forEach(m => { m.castShadow = rtxShadows; m.receiveShadow = rtxShadows; if(m.material){(Array.isArray(m.material)?m.material:[m.material]).forEach(mat=>mat.needsUpdate=true);}});
-  const applyRTXToAll = () => {
-    for (const o of objects.values()) applyRTXToObject(o);
-    for (const l of lights.values()) { l.castShadow = rtxShadows; configureLightShadow(l); }
-  };
   const makeObject = n => {
     const old = objects.get(n);
     if (old) { scene.remove(old); disposeObject(old); }
@@ -282,7 +289,7 @@
     mesh.userData.lightType = "全体";
     mesh.userData.materialTexture = null;
     mesh.userData.textureOverride = null;
-    mesh.castShadow = rtxShadows; mesh.receiveShadow = rtxShadows;
+    patchShadowShader(mesh.material);
     scene.add(mesh); objects.set(n, mesh);
     return mesh;
   };
@@ -297,8 +304,8 @@
     next.userData.lightType = old.userData.lightType || "全体";
     next.userData.materialTexture = old.userData.materialTexture || null;
     next.userData.textureOverride = old.userData.textureOverride || null;
-    applyRTXToObject(next);
     applyPreferredTexture(next);
+    allMeshes(next).forEach(mesh => patchShadowShader(mesh.material));
     scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
   const disposeObject = root => {
@@ -348,15 +355,6 @@
   const box = root => new THREE.Box3().setFromObject(root);
   const touching = (a,b) => Boolean(a && b && !a.userData.passThrough && !b.userData.passThrough && box(a).intersectsBox(box(b)));
   const removeLight = light => { if (light.target) scene.remove(light.target); scene.remove(light); };
-  const configureLightShadow = (light) => {
-    if (!light.shadow) return;
-    light.shadow.mapSize.set(1024, 1024);
-    light.shadow.camera.near = 0.1;
-    light.shadow.camera.far = 200;
-    light.shadow.bias = -0.0005;
-    light.shadow.normalBias = 0.02;
-    if (light.shadow.camera.updateProjectionMatrix) light.shadow.camera.updateProjectionMatrix();
-  };
   const makeLight = (type, intensity=10, lightColor=0xffffff) => {
     let light;
     if (type === "向いてる方向") {
@@ -365,7 +363,6 @@
     } else {
       light = new THREE.PointLight(lightColor, intensity, 100);
     }
-    configureLightShadow(light);
     return light;
   };
   const syncLight = (source, light) => {
@@ -429,6 +426,59 @@
     from.position.copy(savedPos);
   };
 
+  const updateShadowMap = () => {
+    const box = new THREE.Box3();
+    for (const o of objects.values()) box.expandByObject(o);
+    if (box.isEmpty()) return;
+    const sz = box.getSize(new THREE.Vector3());
+    const ctr = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(sz.x, sz.z, 10);
+    shadowCamera.left = -maxDim;
+    shadowCamera.right = maxDim;
+    shadowCamera.top = maxDim;
+    shadowCamera.bottom = -maxDim;
+    shadowCamera.near = 0.1;
+    shadowCamera.far = maxDim * 4 + sz.y + 100;
+    shadowCamera.position.set(ctr.x, box.max.y + maxDim * 2, ctr.z);
+    shadowCamera.lookAt(ctr);
+    shadowCamera.updateMatrixWorld();
+    shadowCamera.updateProjectionMatrix();
+    shadowMatrix.multiplyMatrices(shadowBiasMatrix, shadowCamera.projectionMatrix);
+    shadowMatrix.multiplyMatrices(shadowMatrix, shadowCamera.matrixWorldInverse);
+    shadowMaterial.uniforms.uNear.value = shadowCamera.near;
+    shadowMaterial.uniforms.uFar.value = shadowCamera.far;
+    const passThroughs = [];
+    for (const o of objects.values()) { if (o.userData.passThrough) { passThroughs.push(o); o.visible = false; } }
+    const skyVis = skyDome ? skyDome.visible : null;
+    if (skyDome) skyDome.visible = false;
+    const oldOverride = scene.overrideMaterial;
+    const oldT = glRenderer.getRenderTarget();
+    scene.overrideMaterial = shadowMaterial;
+    glRenderer.setRenderTarget(shadowTarget);
+    glRenderer.clear();
+    glRenderer.render(scene, shadowCamera);
+    scene.overrideMaterial = oldOverride;
+    glRenderer.setRenderTarget(oldT);
+    passThroughs.forEach(o => o.visible = true);
+    if (skyDome) skyDome.visible = skyVis;
+  };
+  const patchShadowShader = (material) => {
+    if (Array.isArray(material)) { material.forEach(m => patchShadowShader(m)); return; }
+    if (!material || patchedMaterials.has(material)) return;
+    patchedMaterials.add(material);
+    const origOnBeforeCompile = material.onBeforeCompile;
+    material.onBeforeCompile = (shader) => {
+      if (origOnBeforeCompile) origOnBeforeCompile(shader);
+      shader.uniforms.shadowMap = shadowUniforms.shadowMap;
+      shader.uniforms.shadowMatrix = shadowUniforms.shadowMatrix;
+      shader.uniforms.shadowsEnabled = shadowUniforms.shadowsEnabled;
+      shader.vertexShader = "varying vec3 vWorldPos;\n" + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n  vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;");
+      shader.fragmentShader = "varying vec3 vWorldPos;\nuniform sampler2D shadowMap;\nuniform mat4 shadowMatrix;\nuniform float shadowsEnabled;\n" + shader.fragmentShader;
+      shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", "#include <color_fragment>\n  if (shadowsEnabled > 0.5) {\n    vec4 sCoord = shadowMatrix * vec4(vWorldPos, 1.0);\n    sCoord.xyz /= sCoord.w;\n    if (sCoord.x >= 0.0 && sCoord.x <= 1.0 && sCoord.y >= 0.0 && sCoord.y <= 1.0 && sCoord.z >= 0.0 && sCoord.z <= 1.0) {\n      float sDepth = texture2D(shadowMap, sCoord.xy).r;\n      if (sCoord.z > sDepth + 0.003) diffuseColor.rgb *= 0.5;\n    }\n  }\n");
+    };
+    material.needsUpdate = true;
+  };
   function updatePhysics(delta) {
     if (delta <= 0) return;
     for (const moving of objects.values()) {
@@ -462,6 +512,8 @@
     if (contextLost) return;
     const delta = Math.min(_physicsClock.getDelta(), 0.05);
     updatePhysics(delta);
+    shadowUniforms.shadowsEnabled.value = shadowsEnabled ? 1.0 : 0.0;
+    if (shadowsEnabled && ++shadowUpdateCounter >= 3) { shadowUpdateCounter = 0; updateShadowMap(); }
     for (const o of objects.values()) if (o.userData.animationMixer) o.userData.animationMixer.update(delta);
     const size = renderer.getNativeSize();
     if (canvas.width !== size[0] || canvas.height !== size[1]) {
@@ -504,6 +556,7 @@
         {opcode:"removeTexture", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のテクスチャを削除する", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"setMaterialURL", blockType:BlockType.COMMAND, text:"素材のurlを [URL] に設定する", arguments:{URL:{type:S,defaultValue:"https://data.nofileteams.com/templeate/"}}},
         {opcode:"setMaterialLoadMethod", blockType:BlockType.COMMAND, text:"素材の読み込み方法を [METHOD] に設定する", arguments:{METHOD:{type:S,menu:"materialLoadMethod"}}},
+        {opcode:"loadMaterials", blockType:BlockType.COMMAND, text:"素材を読み込むまたはアップデートする"},
         {opcode:"modelOBJList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のobjモデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
         {opcode:"modelGLTFList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の(gltf/glb)モデルをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"box"},LIST:{type:S,defaultValue:"list1"}}},
         {opcode:"playAnimation", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] にアニメーション [ANIMATION] を再生する", arguments:{NAME:{type:S,defaultValue:"box"},ANIMATION:{type:S,defaultValue:"Animation"}}},
@@ -559,6 +612,7 @@
         {opcode:"setFog", blockType:BlockType.COMMAND, text:"fogを [STATE] にする", arguments:{STATE:{type:S,menu:"onoff"}}},
         {opcode:"setWorldBrightness", blockType:BlockType.COMMAND, text:"世界の明るさを [VALUE] にする", arguments:{VALUE:{type:N,defaultValue:5}}},
         {opcode:"changeWorldBrightness", blockType:BlockType.COMMAND, text:"世界の明るさを [VALUE] ずつ変える", arguments:{VALUE:{type:N,defaultValue:1}}},
+        {opcode:"setShadows", blockType:BlockType.COMMAND, text:"影を [STATE] にする", arguments:{STATE:{type:S,menu:"onoff",defaultValue:"off"}}},
         "---",
         {opcode:"setLight", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を光源にする [STATE]", arguments:{NAME:{type:S,defaultValue:"light"},STATE:{type:S,menu:"onoff"}}},
         {opcode:"setLightIntensity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の光の強さを [VALUE] に設定する", arguments:{NAME:{type:S,defaultValue:"light"},VALUE:{type:N,defaultValue:10}}},
@@ -584,12 +638,13 @@
       ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff,lighttype,materials,materialLoadMethod}};
     }
 
-    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; rtxShadows=false; glRenderer.shadowMap.type=THREE.PCFShadowMap; camera.position.set(0,0,10); camera.rotation.set(0,0,0); }
+    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; camera.position.set(0,0,10); camera.rotation.set(0,0,0); shadowsEnabled=false; }
     getMaterialMenu(){return materialNames.length ? materialNames : ["(素材なし)"];}
     create(a){makeObject(name(a.NAME));}
     async setMaterialURL(a){materialBaseURL=normalizeBaseURL(a.URL);await refreshMaterialList();if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();}
     async setObjectMaterial(a){const o=object(a.NAME),material=name(a.MATERIAL);if(!o||!materialNames.includes(material))return;let texture;if(materialLoadMethod==="事前に素材の画像をダウンロードする"){let blob=await getCachedBlob(material);if(!blob){const url=materialBaseURL+encodeURIComponent(material)+".png";if(await Scratch.canFetch(url)){const response=await Scratch.fetch(url);if(response.ok){blob=await response.blob();await setCachedBlob(material,blob);}}}if(!blob)return;texture=await blobToTexture(blob);}else{texture=await loadTextureFromURL(materialBaseURL+encodeURIComponent(material)+".png");}if(!texture)return;markTiling(texture);o.userData.materialTexture=texture;applyPreferredTexture(o);updateTilingRepeat(o);}
     async setMaterialLoadMethod(a){materialLoadMethod=name(a.METHOD);if(materialLoadMethod==="事前に素材の画像をダウンロードする")await preloadAllMaterials();}
+    async loadMaterials(){await refreshMaterialList();if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();}
     removeTexture(a){const o=object(a.NAME);if(!o)return;const texture=o.userData.textureOverride;o.userData.textureOverride=null;applyPreferredTexture(o);if(texture&&texture!==o.userData.materialTexture)texture.dispose();}
     remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}
     setPosition(a){const o=object(a.NAME);if(o)o.position.set(num(a.X),num(a.Y),num(a.Z));}
@@ -655,10 +710,11 @@
     setFog(a){fogEnabled=name(a.STATE)==="on";updateFog();}
     setWorldBrightness(a){worldBrightness=Math.max(0,num(a.VALUE));applySkyEffects();}
     changeWorldBrightness(a){worldBrightness=Math.max(0,worldBrightness+num(a.VALUE));applySkyEffects();}
-    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=makeLight(o.userData.lightType||"全体");lights.set(n,l);scene.add(l);}l.castShadow=rtxShadows;syncLight(o,l);}else{const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}}
+    setShadows(a){shadowsEnabled=name(a.STATE)==="on";if(shadowsEnabled)updateShadowMap();}
+    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=makeLight(o.userData.lightType||"全体");lights.set(n,l);scene.add(l);}syncLight(o,l);}else{const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}}
     setLightIntensity(a){const l=lights.get(name(a.NAME));if(l)l.intensity=num(a.VALUE);}
     setLightColor(a){const l=lights.get(name(a.NAME));if(l)l.color.set(color(a.COLOR));}
-    setLightType(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;const type=name(a.TYPE)==="向いてる方向"?"向いてる方向":"全体";o.userData.lightType=type;const old=lights.get(n);if(old){const next=makeLight(type,old.intensity,old.color);next.castShadow=rtxShadows;removeLight(old);lights.set(n,next);scene.add(next);syncLight(o,next);}}
+    setLightType(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;const type=name(a.TYPE)==="向いてる方向"?"向いてる方向":"全体";o.userData.lightType=type;const old=lights.get(n);if(old){const next=makeLight(type,old.intensity,old.color);removeLight(old);lights.set(n,next);scene.add(next);syncLight(o,next);}}
     async setSkyCostume(a,util){const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;if(skyDome){scene.remove(skyDome);disposeObject(skyDome);}skyTexture=texture;skyDome=new THREE.Mesh(new THREE.SphereGeometry(500,60,40),new THREE.MeshBasicMaterial({map:texture,side:THREE.BackSide,fog:false,depthWrite:false}));skyDome.renderOrder=-1;scene.add(skyDome);applySkyEffects();}
     changeSkyColor(a){skyHueEffect=(skyHueEffect+num(a.VALUE))%200;applySkyEffects();}
     changeSkyBrightness(a){skyBrightnessEffect=THREE.MathUtils.clamp(skyBrightnessEffect+num(a.VALUE),-100,100);applySkyEffects();}
@@ -687,9 +743,6 @@
   runtime.on("PROJECT_STOP_ALL", () => { drawing = false; clearSkin(); });
 
   runtime.on("PROJECT_LOADED", async () => {
-    await refreshMaterialList();
-    if(materialLoadMethod==="事前に素材の画像をダウンロードする")preloadAllMaterials();
-    if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();
     drawing = false;
     installBackLayer();
     startRenderLoop();
@@ -700,6 +753,5 @@
     clearSkin();
   });
 
-  await refreshMaterialList();
   Scratch.extensions.register(new BackLayer3D());
 })(Scratch);

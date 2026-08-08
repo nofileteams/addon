@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.6.12
+// Version: 1.6.13
 
 (async function (Scratch) {
   "use strict";
@@ -149,6 +149,23 @@
     shadowLightDir: { value: new THREE.Vector3(0, -1, 0) },
     shadowTexelSize: { value: 0.05 }
   };
+  // [ADD v1.6.12] 「水」機能用の共有アニメーション時計と、水底の疑似コースティクス(光の揺らぎ模様)用uniform。
+  //   waterUniforms.uTime は全ての水オブジェクトの波アニメーションで共有し、常に同期して揺れるようにする。
+  //   causticsUniforms は影(shadow)がonの時だけ、水面より下にあるオブジェクト表面に
+  //   ゆらゆらした光の模様を重ねて「プールの底にいるような」見た目にするために使う。
+  //   影がoffの間はshadowsEnabledがそもそも0なので、この処理は自動的に完全にスキップされる
+  //   (＝影のon/offどちらでも壊れずに動く)。
+  const waterUniforms = { uTime: { value: 0 } };
+  const causticsUniforms = {
+    hasWater: { value: 0.0 },
+    waterLevel: { value: -100000.0 },
+    causticsTime: waterUniforms.uTime
+  };
+  const WATER_DUMMY_TEXTURE = (() => {
+    const t = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat);
+    t.needsUpdate = true;
+    return t;
+  })();
   const patchedMaterials = new WeakSet();
   let skyDome = null;
   let skyTexture = null;
@@ -304,6 +321,26 @@
   const REST_LINEAR_SPEED = 0.05; // これより遅い速度は静止とみなして0にする(跳ね続ける微振動を防止)
   const REST_ANGULAR_SPEED = 0.02;
   const TUMBLE_FACTOR = 0.6;      // 衝突時、水平速度をどれくらい回転(傾き)に変換するか
+  // [ADD v1.6.14] 真上から垂直に落ちてきただけ(水平速度なし)の場合でも、
+  //   着地点が支えている物の中心からズレている(＝端に乗った/はみ出した)ぶんだけ傾くようにする係数。
+  //   これがないと真下に落ちるだけの物体は永遠に「向き」が変わらなかった。
+  const TILT_FACTOR = 1.4;
+  // [FIX v1.6.12] 重力の自然化。
+  //   これまでは「着地した瞬間の反発係数の計算」だけに頼っていたため、静止状態でも
+  //   毎フレーム重力→ごく僅かにめり込む→反発、を延々繰り返し、静止しているはずの物体が
+  //   低振幅でずっと小刻みに震え続ける(不自然にプルプルする)問題があった。
+  //   →「着地」を継続的な状態(grounded)として保持し、着地中に発生する速度は
+  //   ほぼ重力1フレーム分の誤差でしかないので、それ未満の衝撃は弾き返さずそのまま吸収して
+  //   完全に静止させる。実際に上から落ちてきた勢いのある衝突(MIN_BOUNCE_SPEED以上)だけが
+  //   跳ね返るようにすることで、「自然に落ちる→跳ねる→徐々に収まって静止する」という
+  //   現実的な重力挙動になる。
+  const MIN_BOUNCE_SPEED = 0.6;   // これ未満の着地速度は跳ね返さず、そのまま吸収して静止させる
+  const MAX_FALL_SPEED = 40;      // 終端速度。高い場所からの落下でも際限なく加速し続けないようにする
+  // [FIX v1.6.12] 「physicsがonのオブジェクトは水に浮く」用の浮力パラメータ。
+  //   沈み込んでいる割合(submergedRatio)に応じて重力を上回る力で押し上げ、
+  //   水中では速度を強めに減衰させることで、水面付近で自然にバランスして浮くようにする。
+  const WATER_BUOYANCY = 1.7;     // 完全に沈んだ時、重力の何倍の力で押し戻すか
+  const WATER_DRAG = 3.2;         // 水中にいる間の速度減衰の強さ
 
   class CanvasSkin extends renderer.exports.Skin {
     constructor(id) {
@@ -375,6 +412,20 @@
     root.traverse(child => { if (child.isMesh) result.push(child); });
     return result;
   };
+  // [FIX v1.6.14] runtime.extensionManager.refreshBlocks() をブロック実行中(スクリプトのスレッドが
+  //   まだ進行中)に同期的に呼ぶと、TurboWarpのコンパイラがそのスレッドのコンパイル結果を
+  //   即座に無効化してしまい、直後に実行される他のブロック(水にする等)で
+  //   "IR Unknown stacked block" というコンパイルエラーが一時的に出ることがあった。
+  //   実行中のスレッドが完全に抜けた後(次のタスクキュー)で呼び直すことでこれを避ける。
+  let refreshBlocksScheduled = false;
+  const scheduleRefreshBlocks = () => {
+    if (refreshBlocksScheduled) return;
+    refreshBlocksScheduled = true;
+    setTimeout(() => {
+      refreshBlocksScheduled = false;
+      if (runtime.extensionManager && runtime.extensionManager.refreshBlocks) runtime.extensionManager.refreshBlocks();
+    }, 0);
+  };
   const setMaterial = (root, fn) => allMeshes(root).forEach(mesh => {
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     materials.forEach(fn);
@@ -392,6 +443,9 @@
     mesh.userData.angularVelocityX = 0;
     mesh.userData.angularVelocityY = 0;
     mesh.userData.angularVelocityZ = 0;
+    mesh.userData.grounded = false;
+    mesh.userData.isWater = false;
+    mesh.userData.inWater = false;
     mesh.userData.lightType = "全体";
     // [FIX v1.6.8] 光源offのタイミングで強さ/色を保持しておくための初期値。
     mesh.userData.lightIntensity = 10;
@@ -416,6 +470,9 @@
     next.userData.angularVelocityX = old.userData.angularVelocityX || 0;
     next.userData.angularVelocityY = old.userData.angularVelocityY || 0;
     next.userData.angularVelocityZ = old.userData.angularVelocityZ || 0;
+    next.userData.grounded = old.userData.grounded || false;
+    next.userData.isWater = old.userData.isWater || false;
+    next.userData.inWater = old.userData.inWater || false;
     next.userData.lightType = old.userData.lightType || "全体";
     next.userData.lightIntensity = old.userData.lightIntensity != null ? old.userData.lightIntensity : 10;
     next.userData.lightColor = old.userData.lightColor != null ? old.userData.lightColor : 0xffffff;
@@ -429,6 +486,14 @@
     root.traverse(child => {
       if (child.geometry) child.geometry.dispose();
       if (child.material) (Array.isArray(child.material) ? child.material : [child.material]).forEach(m => { reflectiveMaterials.delete(m); m.dispose(); });
+      // [ADD v1.6.12] setWaterで切り替え保存しておいた「元のマテリアル」/「水用マテリアル」のうち、
+      // 現在使われていない方が捨てられずGPUリソースが残り続けないよう、まとめて破棄する。
+      const extras = new Set();
+      if (child.userData) {
+        if (child.userData.waterMaterial) extras.add(child.userData.waterMaterial);
+        if (child.userData.originalMaterial) (Array.isArray(child.userData.originalMaterial) ? child.userData.originalMaterial : [child.userData.originalMaterial]).forEach(m => extras.add(m));
+      }
+      extras.forEach(m => { if (m && m !== child.material) { reflectiveMaterials.delete(m); m.dispose(); } });
     });
   };
   const listValue = (listName, util) => {
@@ -631,6 +696,10 @@
       shader.uniforms.shadowsEnabled = shadowUniforms.shadowsEnabled;
       shader.uniforms.shadowLightDir = shadowUniforms.shadowLightDir;
       shader.uniforms.shadowTexelSize = shadowUniforms.shadowTexelSize;
+      // [ADD v1.6.12] 水底の疑似コースティクス用uniform(影がonの時だけ使われる)
+      shader.uniforms.hasWater = causticsUniforms.hasWater;
+      shader.uniforms.waterLevel = causticsUniforms.waterLevel;
+      shader.uniforms.causticsTime = causticsUniforms.causticsTime;
 
       // [FIX v1.6.6] ワールド法線(vWorldNormal)を追加で渡す。
       //   これが無いと「面が光にほぼ平行(壁など)」な場所でバイアスが一律になり、
@@ -653,6 +722,9 @@
         "uniform float shadowsEnabled;",
         "uniform vec3 shadowLightDir;",
         "uniform float shadowTexelSize;",
+        "uniform float hasWater;",
+        "uniform float waterLevel;",
+        "uniform float causticsTime;",
         shader.fragmentShader
       ].join("\n");
 
@@ -711,11 +783,147 @@
         "      shadow /= 16.0;",
         "      diffuseColor.rgb *= 1.0 - shadow * 0.65;",
         "    }",
+        "  }",
+        // [ADD v1.6.12] 水底のコースティクス(水面のゆらぎで光が集まってできる網目模様)の簡易再現。
+        //   影(shadowsEnabled)がonで、かつシーンに「水」オブジェクトが1つ以上ある時だけ、
+        //   水面より下にある面(プールの床・壁・沈んでいる物体の下側など)にゆらゆら動く
+        //   明暗パターンを重ねる。影がoffの時やwaterが1つも無い時はhasWater/shadowsEnabledが
+        //   0のままなので、このブロックは実質何もせず、両方の状態で安全に動作する。
+        "  if (shadowsEnabled > 0.5 && hasWater > 0.5 && vWorldPos.y < waterLevel) {",
+        "    vec2 cp = vWorldPos.xz * 0.35;",
+        "    float ct = causticsTime;",
+        "    float c1 = sin(cp.x * 2.1 + ct * 1.3) + sin(cp.y * 2.3 - ct * 1.1);",
+        "    float c2 = sin((cp.x + cp.y) * 1.6 - ct * 1.7) + sin((cp.x - cp.y) * 1.9 + ct * 0.8);",
+        "    float caustic = pow(clamp((c1 + c2) * 0.25 + 0.5, 0.0, 1.0), 3.0);",
+        "    float depthFade = clamp(1.0 - (waterLevel - vWorldPos.y) * 0.15, 0.15, 1.0);",
+        "    diffuseColor.rgb += vec3(0.55, 0.95, 1.0) * caustic * 0.45 * depthFade;",
+        "    diffuseColor.rgb *= mix(1.0, 0.9 + caustic * 0.25, depthFade);",
         "  }"
       ].join("\n"));
     };
     material.needsUpdate = true;
   };
+
+  // [ADD v1.6.12] 「水」機能。
+  //   ・頂点シェーダーで複数のサイン波を重ねてゆらゆら波打つ水面にする
+  //   ・フラグメントシェーダーでスクリーンショットのような流れる網目(ワイヤーフレーム風)の
+  //     模様と、波の高いところがうっすら明るくなる簡易的な泡/ハイライトを付ける
+  //   ・任意でユーザーが設定したテクスチャ(リスト or URL)を波の上にブレンドできる
+  //   ・patchShadowShader を必ずかけているので、影のon/offどちらでも(影の有無に関わらず)
+  //     水自体は常に正しく描画され、影をonにした時だけ水底コースティクスと連動する
+  const installWaterShader = material => {
+    const uTime = waterUniforms.uTime;
+    const uTex = { value: WATER_DUMMY_TEXTURE };
+    const uUseTex = { value: 0.0 };
+    material.userData.waterTexUniform = uTex;
+    material.userData.waterUseTexUniform = uUseTex;
+    material.onBeforeCompile = shader => {
+      shader.uniforms.uWaterTime = uTime;
+      shader.uniforms.uWaterTex = uTex;
+      shader.uniforms.uWaterUseTex = uUseTex;
+
+      shader.vertexShader = "uniform float uWaterTime;\nvarying vec2 vWaterUv;\nvarying float vWaterHeight;\n" + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace("#include <project_vertex>", [
+        "  vWaterUv = uv;",
+        // 複数の異なる周波数/速度/向きのサイン波を重ねることで、単調な繰り返しに見えない
+        // 自然な「うねり」を作る(スクリーンショットのような複雑に流れる波紋に近づける)
+        "  float _wx = transformed.x, _wz = transformed.z, _wt = uWaterTime;",
+        "  float _wh = sin(_wx * 1.3 + _wt * 1.1) * 0.05",
+        "    + sin(_wz * 1.7 - _wt * 0.9) * 0.045",
+        "    + sin((_wx + _wz) * 0.8 + _wt * 1.6) * 0.035",
+        "    + sin(sqrt(_wx * _wx + _wz * _wz) * 1.2 - _wt * 2.0) * 0.03;",
+        "  transformed.y += _wh;",
+        "  vWaterHeight = _wh;",
+        "#include <project_vertex>"
+      ].join("\n"));
+
+      shader.fragmentShader = "uniform sampler2D uWaterTex;\nuniform float uWaterUseTex;\nuniform float uWaterTime;\nvarying vec2 vWaterUv;\nvarying float vWaterHeight;\n" + shader.fragmentShader;
+      shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", [
+        "#include <color_fragment>",
+        "  {",
+        // 時間とともに流れる格子状のライン模様。fractによる格子の最寄りの線までの距離を
+        // smoothstepで滑らかにすることで、画像のような細い流れる網目模様になる
+        "    vec2 _guv = vWaterUv * 12.0 + vec2(uWaterTime * 0.06, uWaterTime * 0.045);",
+        "    _guv += vec2(sin(uWaterTime * 0.5 + vWaterUv.y * 6.0), cos(uWaterTime * 0.4 + vWaterUv.x * 6.0)) * 0.15;",
+        "    float _gl = min(abs(fract(_guv.x) - 0.5), abs(fract(_guv.y) - 0.5));",
+        "    float _grid = smoothstep(0.0, 0.06, _gl);",
+        "    diffuseColor.rgb *= mix(0.72, 1.0, _grid);",
+        "    diffuseColor.rgb += vec3(0.5, 0.95, 1.0) * (1.0 - _grid) * 0.10;",
+        // 波の高いところ(波頭)をうっすら明るく(簡易的な泡/ハイライト表現)
+        "    diffuseColor.rgb += vec3(1.0) * clamp(vWaterHeight * 5.0, 0.0, 1.0) * 0.18;",
+        "    if (uWaterUseTex > 0.5) {",
+        "      vec2 _tuv = vWaterUv * 2.0 + vec2(uWaterTime * 0.02, uWaterTime * 0.014);",
+        "      vec4 _wt = texture2D(uWaterTex, _tuv);",
+        "      diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * _wt.rgb * 1.4, 0.85);",
+        "    }",
+        "  }"
+      ].join("\n"));
+    };
+    patchShadowShader(material);
+  };
+  const createWaterMaterial = () => {
+    const m = new THREE.MeshPhysicalMaterial({
+      color: 0x2fbfc9,
+      transparent: true,
+      opacity: 0.82,
+      roughness: 0.12,
+      metalness: 0.0,
+      side: THREE.DoubleSide,
+      depthWrite: true
+    });
+    installWaterShader(m);
+    return m;
+  };
+  // 波が滑らかに見えるよう、まだ低分割のBoxGeometryのままなら分割数を増やしたものに差し替える
+  // (OBJ/GLTFなど既にカスタムなジオメトリを持つオブジェクトは触らない)
+  const ensureWaterGeometry = mesh => {
+    const geo = mesh.geometry;
+    if (!geo || geo.type !== "BoxGeometry" || (geo.userData && geo.userData.waterSubdivided)) return;
+    const p = geo.parameters || {};
+    const next = new THREE.BoxGeometry(p.width || 1, p.height || 1, p.depth || 1, 24, 4, 24);
+    next.userData.waterSubdivided = true;
+    mesh.geometry = next;
+    geo.dispose();
+  };
+  const setWaterState = (root, on) => {
+    root.userData.isWater = Boolean(on);
+    allMeshes(root).forEach(mesh => {
+      if (!mesh.userData.originalMaterial) mesh.userData.originalMaterial = mesh.material;
+      if (on) {
+        ensureWaterGeometry(mesh);
+        const src = Array.isArray(mesh.userData.originalMaterial) ? mesh.userData.originalMaterial[0] : mesh.userData.originalMaterial;
+        if (!mesh.userData.waterMaterial) {
+          const wm = createWaterMaterial();
+          if (src && src.color) wm.color.copy(src.color);
+          mesh.userData.waterMaterial = wm;
+        }
+        // [FIX v1.6.14] 水にするとオブジェクトの透明度が(水用マテリアルの既定値0.82に)
+        //   勝手に変わってしまっていたのを修正。元のマテリアルの透明度をそのまま引き継ぐ。
+        if (src) {
+          mesh.userData.waterMaterial.opacity = src.opacity;
+          mesh.userData.waterMaterial.transparent = src.transparent;
+          mesh.userData.waterMaterial.needsUpdate = true;
+        }
+        mesh.material = mesh.userData.waterMaterial;
+      } else if (mesh.userData.originalMaterial) {
+        mesh.material = mesh.userData.originalMaterial;
+      }
+    });
+  };
+  const applyWaterTexture = (root, texture) => {
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    allMeshes(root).forEach(mesh => {
+      const wm = mesh.userData.waterMaterial;
+      if (!wm) return;
+      const old = wm.userData.waterTexUniform.value;
+      wm.userData.waterTexUniform.value = texture;
+      wm.userData.waterUseTexUniform.value = 1.0;
+      if (old && old !== texture && old !== WATER_DUMMY_TEXTURE) old.dispose();
+    });
+  };
+
   function updatePhysics(delta) {
     if (delta <= 0) return;
     for (const moving of objects.values()) {
@@ -723,7 +931,35 @@
       const u = moving.userData;
 
       // --- 自由落下(重力はYのみに作用するが、X/Zの速度があればそちらにも動く) ---
-      u.velocityY = (u.velocityY || 0) + GRAVITY * delta;
+      // [FIX v1.6.12] 接地(grounded)中は「1フレーム分の重力による誤差」だけを許容し、
+      //   それを超える速度が生まれた場合のみ本当に落下し始めたとみなす。
+      //   これにより静止しているはずの物体が毎フレーム僅かに沈んでは跳ね返る、を
+      //   永遠に繰り返す不自然な微振動(プルプル)がなくなる。
+      u.velocityY = Math.max((u.velocityY || 0) + GRAVITY * delta, -MAX_FALL_SPEED);
+
+      // --- 浮力: physicsがonのオブジェクトが「水」オブジェクトに沈んでいる分だけ上向きに力を加える ---
+      let inWater = false;
+      for (const water of objects.values()) {
+        if (water === moving || !water.userData.isWater) continue;
+        const waterBox = box(water);
+        const movingBox0 = box(moving);
+        if (!movingBox0.intersectsBox(waterBox)) continue;
+        const objHeight = Math.max(1e-4, movingBox0.max.y - movingBox0.min.y);
+        const submerged = Math.min(waterBox.max.y, movingBox0.max.y) - movingBox0.min.y;
+        const submergedRatio = THREE.MathUtils.clamp(submerged / objHeight, 0, 1);
+        if (submergedRatio <= 0) continue;
+        inWater = true;
+        // アルキメデスの原理の簡易再現: 沈んだ割合が大きいほど強く押し上げ、
+        // 水の抵抗(ドラッグ)で速度を素早く減衰させることで水面付近で自然に浮かんで安定する
+        u.velocityY += -GRAVITY * WATER_BUOYANCY * submergedRatio * delta;
+        const drag = Math.pow(1 / (1 + WATER_DRAG * submergedRatio * delta), 1);
+        u.velocityY *= drag;
+        u.velocityX = (u.velocityX || 0) * drag;
+        u.velocityZ = (u.velocityZ || 0) * drag;
+        u.grounded = false;
+      }
+      u.inWater = inWater;
+
       moving.position.x += (u.velocityX || 0) * delta;
       moving.position.y += u.velocityY * delta;
       moving.position.z += (u.velocityZ || 0) * delta;
@@ -742,19 +978,19 @@
         u.angularVelocityZ = Math.abs(navz) < REST_ANGULAR_SPEED ? 0 : navz;
       }
 
-      if (moving.userData.passThrough) continue;
+      if (moving.userData.passThrough) { u.grounded = false; continue; }
       let movingBox = box(moving);
+      let groundedThisFrame = false;
       for (const other of objects.values()) {
-        if (other === moving || other.userData.passThrough) continue;
+        // [FIX v1.6.12] 「水」は固い床としては扱わない(浮力だけで浮かせるので、
+        //   ここで押し出してしまうと水面に瞬間的に弾かれる不自然な挙動になる)
+        if (other === moving || other.userData.passThrough || other.userData.isWater) continue;
         const otherBox = box(other);
         if (!movingBox.intersectsBox(otherBox)) continue;
 
         // [FIX v1.6.11] 「触れた瞬間に相手の真上へワープする」不自然な重力を廃止。
         // 3軸それぞれのめり込み量(overlap)を比較し、最も浅い軸を衝突面とみなす標準的なMTV法で
         // "めり込んだ分だけ" 押し戻す(＝ワープではなく実際に接触した位置に留める)。
-        // さらに速度を0にして止めるのではなく反発係数(RESTITUTION)で跳ね返し、摩擦(GROUND_FRICTION)で
-        // 水平方向の勢いを減衰させ、着地の勢いを回転(TUMBLE_FACTOR)に変換することで、
-        // 「自然に落下→バウンドしながら傾いて→やがて静止する」重力らしい挙動にする。
         const overlapX = Math.min(movingBox.max.x - otherBox.min.x, otherBox.max.x - movingBox.min.x);
         const overlapY = Math.min(movingBox.max.y - otherBox.min.y, otherBox.max.y - movingBox.min.y);
         const overlapZ = Math.min(movingBox.max.z - otherBox.min.z, otherBox.max.z - movingBox.min.z);
@@ -774,22 +1010,43 @@
         const v = u[velKey] || 0;
         // 衝突面へ向かっていた速度成分だけを反発させる(既に離れる向きに動いていれば何もしない)
         if (v * direction < 0) {
-          const bounced = -v * RESTITUTION;
-          u[velKey] = Math.abs(bounced) < REST_LINEAR_SPEED ? 0 : bounced;
+          const impactSpeed = Math.abs(v);
+          if (key === "y" && direction > 0 && impactSpeed < MIN_BOUNCE_SPEED) {
+            // [FIX v1.6.12] ほぼ静止状態からの着地(=1フレーム分の重力による誤差程度)は
+            //   跳ね返さずそのまま吸収して完全に静止させる。これで永遠に続く微振動を防ぐ。
+            u[velKey] = 0;
+            groundedThisFrame = true;
+          } else {
+            const bounced = -v * RESTITUTION;
+            u[velKey] = Math.abs(bounced) < REST_LINEAR_SPEED ? 0 : bounced;
 
-          if (key === "y" && direction > 0) {
-            // 物の上に着地したケース: 摩擦で水平速度を減衰させ、その勢いを回転(傾き)に変換する
-            u.velocityX = (u.velocityX || 0) * GROUND_FRICTION;
-            u.velocityZ = (u.velocityZ || 0) * GROUND_FRICTION;
-            u.angularVelocityZ = (u.angularVelocityZ || 0) - u.velocityX * TUMBLE_FACTOR;
-            u.angularVelocityX = (u.angularVelocityX || 0) + u.velocityZ * TUMBLE_FACTOR;
-          } else if (key !== "y") {
-            // 側面(壁や他のオブジェクトの横)にぶつかったケース: 少し傾ける演出
-            u.angularVelocityY = (u.angularVelocityY || 0) + v * TUMBLE_FACTOR * 0.5;
+            if (key === "y" && direction > 0) {
+              // 物の上に着地したケース: 摩擦で水平速度を減衰させ、その勢いを回転(傾き)に変換する
+              u.velocityX = (u.velocityX || 0) * GROUND_FRICTION;
+              u.velocityZ = (u.velocityZ || 0) * GROUND_FRICTION;
+              u.angularVelocityZ = (u.angularVelocityZ || 0) - u.velocityX * TUMBLE_FACTOR;
+              u.angularVelocityX = (u.angularVelocityX || 0) + u.velocityZ * TUMBLE_FACTOR;
+              // [ADD v1.6.14] 水平速度が0(真下に落ちただけ)でも、着地点が支えの中心からズレていれば
+              //   その分だけ傾ける(重心が支持面からはみ出すほど大きく傾く簡易的な表現)
+              const supportHalfX = Math.max((otherBox.max.x - otherBox.min.x) / 2, 1e-4);
+              const supportHalfZ = Math.max((otherBox.max.z - otherBox.min.z) / 2, 1e-4);
+              const overhangX = THREE.MathUtils.clamp((movingCenter.x - otherCenter.x) / supportHalfX, -1, 1);
+              const overhangZ = THREE.MathUtils.clamp((movingCenter.z - otherCenter.z) / supportHalfZ, -1, 1);
+              u.angularVelocityZ -= overhangX * TILT_FACTOR * Math.min(impactSpeed, 1);
+              u.angularVelocityX += overhangZ * TILT_FACTOR * Math.min(impactSpeed, 1);
+              if (Math.abs(u[velKey]) < REST_LINEAR_SPEED) groundedThisFrame = true;
+            } else if (key !== "y") {
+              // 側面(壁や他のオブジェクトの横)にぶつかったケース: 少し傾ける演出
+              u.angularVelocityY = (u.angularVelocityY || 0) + v * TUMBLE_FACTOR * 0.5;
+            }
           }
+        } else if (key === "y" && direction > 0 && Math.abs(v) < MIN_BOUNCE_SPEED) {
+          // 既にほぼ静止した状態で接地面に触れ続けている(=乗っている)ケース
+          groundedThisFrame = true;
         }
         movingBox = box(moving);
       }
+      u.grounded = groundedThisFrame;
     }
   }
 
@@ -806,6 +1063,18 @@
     if (contextLost) return;
     const delta = Math.min(_physicsClock.getDelta(), 0.05);
     updatePhysics(delta);
+    waterUniforms.uTime.value += delta;
+    // [ADD v1.6.12] シーンに「水」オブジェクトがあるかどうかと、その水面の高さ(一番高いものを採用)を
+    // 毎フレーム更新しておく。これは影(shadow)がonの時の水底コースティクス表現でのみ参照される。
+    let anyWater = false, waterTopY = -100000;
+    for (const o of objects.values()) {
+      if (!o.userData.isWater) continue;
+      anyWater = true;
+      const top = box(o).max.y;
+      if (top > waterTopY) waterTopY = top;
+    }
+    causticsUniforms.hasWater.value = anyWater ? 1.0 : 0.0;
+    causticsUniforms.waterLevel.value = anyWater ? waterTopY : -100000;
     shadowUniforms.shadowsEnabled.value = shadowsEnabled ? 1.0 : 0.0;
     if (shadowsEnabled && ++shadowUpdateCounter >= 3) { shadowUpdateCounter = 0; updateShadowMap(); }
     for (const o of objects.values()) if (o.userData.animationMixer) o.userData.animationMixer.update(delta);
@@ -892,6 +1161,9 @@
         {opcode:"setOpacity", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の透明度を [VALUE] % にする", arguments:{NAME:{type:S,defaultValue:"box"},VALUE:{type:N,defaultValue:0}}},
         {opcode:"setPassThrough", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の貫通を [STATE] にする", arguments:{NAME:{type:S,defaultValue:"box"},STATE:{type:S,menu:"onoff"}}},
         {opcode:"setPhysics", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] のphysicsを [STATE] にする", arguments:{NAME:{type:S,defaultValue:"box"},STATE:{type:S,menu:"onoff"}}},
+        {opcode:"setWater", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] を水にする [STATE]", arguments:{NAME:{type:S,defaultValue:"water"},STATE:{type:S,menu:"onoff",defaultValue:"off"}}},
+        {opcode:"setWaterTextureList", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の水のテクスチャをリスト [LIST] に設定する", arguments:{NAME:{type:S,defaultValue:"water"},LIST:{type:S,defaultValue:"list1"}}},
+        {opcode:"setWaterTextureURL", blockType:BlockType.COMMAND, text:"オブジェクト [NAME] の水のテクスチャをURL [URL] から読み込んで設定する", arguments:{NAME:{type:S,defaultValue:"water"},URL:{type:S,defaultValue:"https://nofileteams.com/templeate/water.jpg"}}},
         {opcode:"bounce", blockType:BlockType.COMMAND, text:"もしオブジェクト [NAME] が他のオブジェクトに触れたら跳ね返る", arguments:{NAME:{type:S,defaultValue:"box"}}},
         {opcode:"isTouching", blockType:BlockType.BOOLEAN, text:"オブジェクト [NAME] がオブジェクト [TARGET] に触れた", arguments:{NAME:{type:S,defaultValue:"box"},TARGET:{type:S,defaultValue:"target"}}},
         {opcode:"objectExists", blockType:BlockType.BOOLEAN, text:"オブジェクト [NAME] が存在する？", arguments:{NAME:{type:S,defaultValue:"box"}}},
@@ -935,10 +1207,10 @@
     reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); reflectiveMaterials.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; camera.position.set(0,0,10); camera.rotation.set(0,0,0); shadowsEnabled=false; }
     getMaterialMenu(){return materialNames.length ? materialNames : ["(素材なし)"];}
     create(a){makeObject(name(a.NAME));}
-    async setMaterialURL(a){materialBaseURL=normalizeBaseURL(a.URL);await refreshMaterialList();if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();}
+    async setMaterialURL(a){materialBaseURL=normalizeBaseURL(a.URL);await refreshMaterialList();scheduleRefreshBlocks();}
     async setObjectMaterial(a){const o=object(a.NAME),material=name(a.MATERIAL);if(!o||!materialNames.includes(material))return;let texture;if(materialLoadMethod==="事前に素材の画像をダウンロードする"){let blob=await getCachedBlob(material);if(!blob){const url=materialBaseURL+encodeURIComponent(material)+".png";if(await Scratch.canFetch(url)){const response=await Scratch.fetch(url);if(response.ok){blob=await response.blob();await setCachedBlob(material,blob);}}}if(!blob)return;texture=await blobToTexture(blob);}else{texture=await loadTextureFromURL(materialBaseURL+encodeURIComponent(material)+".png");}if(!texture)return;markTiling(texture);o.userData.materialTexture=texture;applyPreferredTexture(o);updateTilingRepeat(o);}
     async setMaterialLoadMethod(a){materialLoadMethod=name(a.METHOD);if(materialLoadMethod==="事前に素材の画像をダウンロードする")await preloadAllMaterials();}
-    async loadMaterials(){await refreshMaterialList();if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();}
+    async loadMaterials(){await refreshMaterialList();scheduleRefreshBlocks();}
     removeTexture(a){const o=object(a.NAME);if(!o)return;const texture=o.userData.textureOverride;o.userData.textureOverride=null;applyPreferredTexture(o);if(texture&&texture!==o.userData.materialTexture)texture.dispose();}
     remove(a){const n=name(a.NAME),o=objects.get(n);if(o){scene.remove(o);disposeObject(o);objects.delete(n);} const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}
     setPosition(a){const o=object(a.NAME);if(o)o.position.set(num(a.X),num(a.Y),num(a.Z));}
@@ -978,7 +1250,10 @@
     setColor(a){const o=object(a.NAME);if(o)setMaterial(o,m=>m.color&&m.color.set(color(a.COLOR)));}
     setOpacity(a){const o=object(a.NAME),opacity=THREE.MathUtils.clamp(1-num(a.VALUE)/100,0,1);if(o)setMaterial(o,m=>{m.transparent=opacity<1;m.opacity=opacity;m.needsUpdate=true;});}
     setPassThrough(a){const o=object(a.NAME);if(o)o.userData.passThrough=name(a.STATE)==="on";}
-    setPhysics(a){const o=object(a.NAME);if(o){o.userData.physics=name(a.STATE)==="on";if(!o.userData.physics){o.userData.velocityX=0;o.userData.velocityY=0;o.userData.velocityZ=0;o.userData.angularVelocityX=0;o.userData.angularVelocityY=0;o.userData.angularVelocityZ=0;}}}
+    setPhysics(a){const o=object(a.NAME);if(o){o.userData.physics=name(a.STATE)==="on";if(!o.userData.physics){o.userData.velocityX=0;o.userData.velocityY=0;o.userData.velocityZ=0;o.userData.angularVelocityX=0;o.userData.angularVelocityY=0;o.userData.angularVelocityZ=0;o.userData.grounded=false;}}}
+    setWater(a){const o=object(a.NAME);if(o)setWaterState(o,name(a.STATE)==="on");}
+    async setWaterTextureList(a,util){const o=object(a.NAME);if(!o||!o.userData.isWater)return;const items=listValue(a.LIST,util);if(!items.length)return;const numeric=items.every(v=>Number.isInteger(Number(v))&&Number(v)>=0&&Number(v)<=255);if(!numeric)return;const blob=new Blob([Uint8Array.from(items,Number)],{type:"image/jpeg"});const texture=await blobToTexture(blob);if(!texture)return;applyWaterTexture(o,texture);}
+    async setWaterTextureURL(a){const o=object(a.NAME);if(!o||!o.userData.isWater)return;const texture=await loadTextureFromURL(name(a.URL));if(!texture)return;applyWaterTexture(o,texture);}
     isTouching(a){return Boolean(touching(object(a.NAME),object(a.TARGET)));}
     objectExists(a){return objects.has(name(a.NAME));}
     bounce(a){

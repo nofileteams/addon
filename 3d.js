@@ -3,7 +3,7 @@
 // Description: 3D objects rendered behind every Scratch sprite.
 // By: nofileteams
 // License: MIT
-// Version: 1.6.6
+// Version: 1.6.12
 
 (async function (Scratch) {
   "use strict";
@@ -37,6 +37,7 @@
   canvas.addEventListener("webglcontextrestored", () => {
     contextLost = false;
     installBackLayer();
+    refreshReflectiveMaterials(); // [FIX v1.6.12] 反射中のオブジェクトがある場合のみGPUリソースを再生成する
     startRenderLoop();
   }, false);
 
@@ -45,6 +46,60 @@
   camera.position.set(0, 0, 10);
   const ambient = new THREE.AmbientLight(0xffffff, 0.65);
   scene.add(ambient);
+  // [FIX v1.6.11→v1.6.12] 「反射の強さ」を設定した時だけ、そのオブジェクトが環境を映り込むようにする。
+  //   以前の修正でscene.environmentを常時グローバルに設定していたため、反射を一切上げていない
+  //   デフォルトのオブジェクトまでうっすら環境を映り込んでしまっていた。
+  //   → scene.environmentは使わず、setReflectivityで値が0より大きく設定されたマテリアルにだけ
+  //   個別に envMap を割り当てる方式に変更。値を0に戻せばenvMapも外れ、反射しなくなる。
+  const pmremGenerator = new THREE.PMREMGenerator(glRenderer);
+  pmremGenerator.compileEquirectangularShader();
+  let envTexture = null;
+  let currentEnvRT = null;
+  const reflectiveMaterials = new Set();
+  const buildDefaultEnvironmentScene = () => {
+    const envScene = new THREE.Scene();
+    const gradient = new THREE.Mesh(
+      new THREE.SphereGeometry(50, 32, 32),
+      new THREE.ShaderMaterial({
+        side: THREE.BackSide,
+        uniforms: {
+          topColor: {value: new THREE.Color(0xdfe9ff)},
+          bottomColor: {value: new THREE.Color(0x33353d)}
+        },
+        vertexShader: "varying vec3 vPos;void main(){vPos=position;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}",
+        fragmentShader: "varying vec3 vPos;uniform vec3 topColor;uniform vec3 bottomColor;void main(){float h=normalize(vPos).y*0.5+0.5;gl_FragColor=vec4(mix(bottomColor,topColor,h),1.0);}"
+      })
+    );
+    envScene.add(gradient);
+    const keyLight = new THREE.PointLight(0xffffff, 40, 200);
+    keyLight.position.set(12, 18, 12);
+    envScene.add(keyLight);
+    const fillLight = new THREE.PointLight(0xffffff, 18, 200);
+    fillLight.position.set(-14, 6, -10);
+    envScene.add(fillLight);
+    return envScene;
+  };
+  // 環境マップ本体を(必要なら再)生成するだけで、どのマテリアルにも自動では適用しない。
+  const regenerateEnvTexture = () => {
+    const prevRT = currentEnvRT;
+    if (skyTexture && skyTexture.image) {
+      currentEnvRT = pmremGenerator.fromEquirectangular(skyTexture);
+    } else {
+      const envScene = buildDefaultEnvironmentScene();
+      currentEnvRT = pmremGenerator.fromScene(envScene, 0.04);
+      envScene.traverse(child => { if (child.isMesh) { child.geometry.dispose(); child.material.dispose(); } });
+    }
+    envTexture = currentEnvRT.texture;
+    if (prevRT) prevRT.dispose();
+    return envTexture;
+  };
+  // 既に反射がonになっている(=envMapを持っている)マテリアルだけに、最新の環境マップを配り直す。
+  //   反射を上げていないオブジェクトのマテリアルはこのSetに入らないため一切影響を受けない。
+  const refreshReflectiveMaterials = () => {
+    if (reflectiveMaterials.size === 0) return;
+    regenerateEnvTexture();
+    for (const m of reflectiveMaterials) { m.envMap = envTexture; m.needsUpdate = true; }
+  };
   const objects = new Map();
   const lights = new Map();
   let drawing = false;
@@ -69,10 +124,16 @@
     generateMipmaps: false,
     depthBuffer: true
   });
+  // [FIX v1.6.9] 影の深度パス(shadowMaterial)がオブジェクトのテクスチャ(alphaTest/map)を
+  //   一切無視していたため、透明にしたい部分まで「完全な不透明の箱」として深度マップに焼き込まれ、
+  //   オブジェクト自身がその誤った深度と衝突してセルフシャドウ判定されてしまい、
+  //   本来テクスチャが透明で背景が見えるはずの面が(減光係数のかかった)黒一色に潰れて見えていた。
+  //   → 深度パスにも uMap(現在描画中メッシュの実テクスチャ)/uAlphaTest を渡し、
+  //   通常描画と同じ条件で discard するようにして、透明部分は深度も書き込まれないようにする。
   const shadowMaterial = new THREE.ShaderMaterial({
-    vertexShader: "varying float vDepth;void main(){vec4 mv=modelViewMatrix*vec4(position,1.0);vDepth=-mv.z;gl_Position=projectionMatrix*mv;}",
-    fragmentShader: "varying float vDepth;uniform float uNear;uniform float uFar;void main(){float d=(vDepth-uNear)/(uFar-uNear);gl_FragColor=vec4(d,d,d,1.0);}",
-    uniforms: { uNear: { value: 0.1 }, uFar: { value: 500 } }
+    vertexShader: "varying float vDepth;varying vec2 vUv;void main(){vUv=uv;vec4 mv=modelViewMatrix*vec4(position,1.0);vDepth=-mv.z;gl_Position=projectionMatrix*mv;}",
+    fragmentShader: "varying float vDepth;varying vec2 vUv;uniform float uNear;uniform float uFar;uniform sampler2D uMap;uniform float uUseMap;uniform float uAlphaTest;void main(){if(uUseMap>0.5){float a=texture2D(uMap,vUv).a;if(a<uAlphaTest)discard;}float d=(vDepth-uNear)/(uFar-uNear);gl_FragColor=vec4(d,d,d,1.0);}",
+    uniforms: { uNear: { value: 0.1 }, uFar: { value: 500 }, uMap: { value: null }, uUseMap: { value: 0 }, uAlphaTest: { value: 0 } }
   });
   const shadowCamera = new THREE.OrthographicCamera(-50, 50, 50, -50, 0.1, 500);
   const shadowBiasMatrix = new THREE.Matrix4();
@@ -210,7 +271,19 @@
   const applyPreferredTexture = root => {
     const override = Boolean(root.userData.textureOverride);
     const texture = root.userData.textureOverride || root.userData.materialTexture || null;
-    setMaterial(root, m => { m.map=texture; m.transparent=Boolean(texture); m.depthWrite=!texture; m.needsUpdate=true; });
+    // [FIX v1.6.7] テクスチャを貼るたびに transparent=true / depthWrite=false にしていたため、
+    // 不透明テクスチャでも深度が書き込まれず、箱の裏側/内側の面が手前の面を突き抜けて
+    // 見える描画崩れ(ソート崩れ)が発生していた。
+    // 通常のブレンディングではなく alphaTest によるカットアウトに切り替えることで、
+    // 不透明テクスチャは正しく深度を書き込みつつ、部分的に透明なテクスチャ(葉っぱ等)も
+    // 引き続き扱えるようにする。
+    setMaterial(root, m => {
+      m.map = texture;
+      m.transparent = false;
+      m.alphaTest = texture ? 0.5 : 0;
+      m.depthWrite = true;
+      m.needsUpdate = true;
+    });
     if (!override) updateTilingRepeat(root);
   };
 
@@ -221,7 +294,16 @@
   const _deltaQuat = new THREE.Quaternion();
   const _shadowLightDirTmp = new THREE.Vector3();
   const _physicsClock = new THREE.Clock();
+  const _physicsCenterA = new THREE.Vector3();
+  const _physicsCenterB = new THREE.Vector3();
   const GRAVITY = -9.8;
+  // [FIX v1.6.11] 「触れたら真上にTP」する不自然な重力を廃止し、自然な落下/バウンド/傾きに変更するための係数
+  const RESTITUTION = 0.35;       // 反発係数(0=跳ねない〜1=完全に跳ね返る)
+  const GROUND_FRICTION = 0.85;   // 着地時に水平方向の速度へかける摩擦(1フレームごと)
+  const ANGULAR_DAMPING = 0.98;   // 回転速度の空気抵抗による減衰(1フレームあたり, 60fps基準)
+  const REST_LINEAR_SPEED = 0.05; // これより遅い速度は静止とみなして0にする(跳ね続ける微振動を防止)
+  const REST_ANGULAR_SPEED = 0.02;
+  const TUMBLE_FACTOR = 0.6;      // 衝突時、水平速度をどれくらい回転(傾き)に変換するか
 
   class CanvasSkin extends renderer.exports.Skin {
     constructor(id) {
@@ -304,11 +386,20 @@
     mesh.name = n;
     mesh.userData.passThrough = false;
     mesh.userData.physics = false;
+    mesh.userData.velocityX = 0;
     mesh.userData.velocityY = 0;
+    mesh.userData.velocityZ = 0;
+    mesh.userData.angularVelocityX = 0;
+    mesh.userData.angularVelocityY = 0;
+    mesh.userData.angularVelocityZ = 0;
     mesh.userData.lightType = "全体";
+    // [FIX v1.6.8] 光源offのタイミングで強さ/色を保持しておくための初期値。
+    mesh.userData.lightIntensity = 10;
+    mesh.userData.lightColor = 0xffffff;
     mesh.userData.materialTexture = null;
     mesh.userData.textureOverride = null;
     patchShadowShader(mesh.material);
+    attachDepthMapSync(mesh);
     scene.add(mesh); objects.set(n, mesh);
     return mesh;
   };
@@ -319,18 +410,25 @@
     next.position.copy(old.position); next.rotation.copy(old.rotation); next.scale.copy(old.scale);
     next.userData.passThrough = old.userData.passThrough;
     next.userData.physics = old.userData.physics || false;
+    next.userData.velocityX = old.userData.velocityX || 0;
     next.userData.velocityY = old.userData.velocityY || 0;
+    next.userData.velocityZ = old.userData.velocityZ || 0;
+    next.userData.angularVelocityX = old.userData.angularVelocityX || 0;
+    next.userData.angularVelocityY = old.userData.angularVelocityY || 0;
+    next.userData.angularVelocityZ = old.userData.angularVelocityZ || 0;
     next.userData.lightType = old.userData.lightType || "全体";
+    next.userData.lightIntensity = old.userData.lightIntensity != null ? old.userData.lightIntensity : 10;
+    next.userData.lightColor = old.userData.lightColor != null ? old.userData.lightColor : 0xffffff;
     next.userData.materialTexture = old.userData.materialTexture || null;
     next.userData.textureOverride = old.userData.textureOverride || null;
     applyPreferredTexture(next);
-    allMeshes(next).forEach(mesh => patchShadowShader(mesh.material));
+    allMeshes(next).forEach(mesh => { patchShadowShader(mesh.material); attachDepthMapSync(mesh); });
     scene.remove(old); disposeObject(old); scene.add(next); objects.set(n, next);
   };
   const disposeObject = root => {
     root.traverse(child => {
       if (child.geometry) child.geometry.dispose();
-      if (child.material) (Array.isArray(child.material) ? child.material : [child.material]).forEach(m => m.dispose());
+      if (child.material) (Array.isArray(child.material) ? child.material : [child.material]).forEach(m => { reflectiveMaterials.delete(m); m.dispose(); });
     });
   };
   const listValue = (listName, util) => {
@@ -505,6 +603,22 @@
     hiddenObjs.forEach(o => o.visible = true);
     if (skyDome) skyDome.visible = skyVis;
   };
+  // [FIX v1.6.9] scene.overrideMaterial は全オブジェクトの描画に同じ shadowMaterial インスタンスを
+  //   使い回すため、メッシュごとに違うテクスチャ/alphaTestを渡す必要がある。
+  //   Object3D.onBeforeRender は各メッシュの描画直前に呼ばれ、その時点で実際に使われる material
+  //   (overrideMaterial適用時はshadowMaterialそのもの)を受け取れるので、それが shadowMaterial の
+  //   場合(=影の深度パス中)だけ、このメッシュ自身の本来のmap/alphaTestを uMap/uAlphaTest に反映する。
+  //   通常のカラーパス(material !== shadowMaterial)では何もしないので、他の描画には影響しない。
+  const attachDepthMapSync = mesh => {
+    mesh.onBeforeRender = (r, s, c, geometry, material) => {
+      if (material !== shadowMaterial) return;
+      const own = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+      const tex = own && own.map ? own.map : null;
+      shadowMaterial.uniforms.uMap.value = tex;
+      shadowMaterial.uniforms.uUseMap.value = tex ? 1 : 0;
+      shadowMaterial.uniforms.uAlphaTest.value = (own && tex) ? own.alphaTest : 0;
+    };
+  };
   const patchShadowShader = (material) => {
     if (Array.isArray(material)) { material.forEach(m => patchShadowShader(m)); return; }
     if (!material || patchedMaterials.has(material)) return;
@@ -581,7 +695,16 @@
         "      float sAngle = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.28318530718;",
         "      float sCa = cos(sAngle), sSa = sin(sAngle);",
         "      mat2 sRot = mat2(sCa, -sSa, sSa, sCa);",
-        "      float sRadius = shadowTexelSize * 3.0;",
+        // [FIX v1.6.8] shadowTexelSize はワールド空間の1テクセルの実寸(バイアス計算用)だが、
+        // ここでの sOff は shadowMap の「UV空間(0〜1)」上のオフセットとして sCoord.xy に加算される。
+        // 単位が違う値をそのまま使っていたため、シーン全体(全オブジェクト)のバウンディングボックスから
+        // 求めた frust が大きいシーンほど shadowTexelSize(ワールド単位)が大きくなり、
+        // UVオフセットとして解釈すると数百px規模のとても広い範囲をサンプリングしてしまっていた。
+        // 大きな低ポリオブジェクト(壁など)は影の範囲が広いため誤差が目立たないが、
+        // 小さく丸みのある(面が多い＝滑らかな曲面の)オブジェクトは影の範囲がその誤ったサンプル半径より
+        // 小さいため、無関係な(影になっていない)テクセルばかり平均されて影がほぼ消えてしまっていた。
+        // → shadowMap解像度(shadowMapSize)を基準にした「UV空間の1テクセル分」を使うよう修正。
+        `      float sRadius = (1.0 / ${shadowMapSize.toFixed(1)}) * 3.0;`,
         "      float shadow = 0.0;",
         // 二値比較ではなくsmoothstepで各サンプルを連続値化 → 影の濃淡段階が16サンプル×連続値でなめらかに
         sampleLines,
@@ -597,17 +720,74 @@
     if (delta <= 0) return;
     for (const moving of objects.values()) {
       if (!moving.userData.physics) continue;
-      moving.userData.velocityY = (moving.userData.velocityY || 0) + GRAVITY * delta;
-      moving.position.y += moving.userData.velocityY * delta;
+      const u = moving.userData;
+
+      // --- 自由落下(重力はYのみに作用するが、X/Zの速度があればそちらにも動く) ---
+      u.velocityY = (u.velocityY || 0) + GRAVITY * delta;
+      moving.position.x += (u.velocityX || 0) * delta;
+      moving.position.y += u.velocityY * delta;
+      moving.position.z += (u.velocityZ || 0) * delta;
+
+      // --- 角速度による自然な傾き/転がり(見た目の演出。空気抵抗で徐々に収まる) ---
+      const avx = u.angularVelocityX || 0, avy = u.angularVelocityY || 0, avz = u.angularVelocityZ || 0;
+      if (avx || avy || avz) {
+        if (avx) { _deltaQuat.setFromAxisAngle(_localAxisX, avx * delta); moving.quaternion.premultiply(_deltaQuat); }
+        if (avy) { _deltaQuat.setFromAxisAngle(_localAxisY, avy * delta); moving.quaternion.premultiply(_deltaQuat); }
+        if (avz) { _deltaQuat.setFromAxisAngle(_localAxisZ, avz * delta); moving.quaternion.premultiply(_deltaQuat); }
+        moving.rotation.setFromQuaternion(moving.quaternion);
+        const damp = Math.pow(ANGULAR_DAMPING, delta * 60);
+        const navx = avx * damp, navy = avy * damp, navz = avz * damp;
+        u.angularVelocityX = Math.abs(navx) < REST_ANGULAR_SPEED ? 0 : navx;
+        u.angularVelocityY = Math.abs(navy) < REST_ANGULAR_SPEED ? 0 : navy;
+        u.angularVelocityZ = Math.abs(navz) < REST_ANGULAR_SPEED ? 0 : navz;
+      }
+
       if (moving.userData.passThrough) continue;
       let movingBox = box(moving);
       for (const other of objects.values()) {
         if (other === moving || other.userData.passThrough) continue;
         const otherBox = box(other);
         if (!movingBox.intersectsBox(otherBox)) continue;
-        if (moving.userData.velocityY <= 0) moving.position.y += otherBox.max.y - movingBox.min.y;
-        else moving.position.y -= movingBox.max.y - otherBox.min.y;
-        moving.userData.velocityY = 0;
+
+        // [FIX v1.6.11] 「触れた瞬間に相手の真上へワープする」不自然な重力を廃止。
+        // 3軸それぞれのめり込み量(overlap)を比較し、最も浅い軸を衝突面とみなす標準的なMTV法で
+        // "めり込んだ分だけ" 押し戻す(＝ワープではなく実際に接触した位置に留める)。
+        // さらに速度を0にして止めるのではなく反発係数(RESTITUTION)で跳ね返し、摩擦(GROUND_FRICTION)で
+        // 水平方向の勢いを減衰させ、着地の勢いを回転(TUMBLE_FACTOR)に変換することで、
+        // 「自然に落下→バウンドしながら傾いて→やがて静止する」重力らしい挙動にする。
+        const overlapX = Math.min(movingBox.max.x - otherBox.min.x, otherBox.max.x - movingBox.min.x);
+        const overlapY = Math.min(movingBox.max.y - otherBox.min.y, otherBox.max.y - movingBox.min.y);
+        const overlapZ = Math.min(movingBox.max.z - otherBox.min.z, otherBox.max.z - movingBox.min.z);
+        const overlaps = [overlapX, overlapY, overlapZ];
+        const axis = overlaps.indexOf(Math.min(overlapX, overlapY, overlapZ));
+        if (overlaps[axis] <= 1e-7) continue;
+        const key = ["x", "y", "z"][axis];
+
+        const movingCenter = movingBox.getCenter(_physicsCenterA);
+        const otherCenter = otherBox.getCenter(_physicsCenterB);
+        const direction = movingCenter[key] >= otherCenter[key] ? 1 : -1;
+
+        // めり込んだ分だけ押し戻す(実測のめり込み量ぶんの最小移動。相手の上面へのワープはしない)
+        moving.position[key] += direction * (overlaps[axis] + 1e-5);
+
+        const velKey = "velocity" + key.toUpperCase();
+        const v = u[velKey] || 0;
+        // 衝突面へ向かっていた速度成分だけを反発させる(既に離れる向きに動いていれば何もしない)
+        if (v * direction < 0) {
+          const bounced = -v * RESTITUTION;
+          u[velKey] = Math.abs(bounced) < REST_LINEAR_SPEED ? 0 : bounced;
+
+          if (key === "y" && direction > 0) {
+            // 物の上に着地したケース: 摩擦で水平速度を減衰させ、その勢いを回転(傾き)に変換する
+            u.velocityX = (u.velocityX || 0) * GROUND_FRICTION;
+            u.velocityZ = (u.velocityZ || 0) * GROUND_FRICTION;
+            u.angularVelocityZ = (u.angularVelocityZ || 0) - u.velocityX * TUMBLE_FACTOR;
+            u.angularVelocityX = (u.angularVelocityX || 0) + u.velocityZ * TUMBLE_FACTOR;
+          } else if (key !== "y") {
+            // 側面(壁や他のオブジェクトの横)にぶつかったケース: 少し傾ける演出
+            u.angularVelocityY = (u.angularVelocityY || 0) + v * TUMBLE_FACTOR * 0.5;
+          }
+        }
         movingBox = box(moving);
       }
     }
@@ -752,7 +932,7 @@
       ], menus:{axis:{acceptReporters:true,items:["x","y","z"]},onoff,lighttype,materials,materialLoadMethod}};
     }
 
-    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; camera.position.set(0,0,10); camera.rotation.set(0,0,0); shadowsEnabled=false; }
+    reset(){ for(const o of objects.values()){scene.remove(o);disposeObject(o);} objects.clear(); for(const l of lights.values())removeLight(l); lights.clear(); reflectiveMaterials.clear(); if(skyDome){scene.remove(skyDome);disposeObject(skyDome);skyDome=null;skyTexture=null;} cameraObject=null; camera.position.set(0,0,10); camera.rotation.set(0,0,0); shadowsEnabled=false; }
     getMaterialMenu(){return materialNames.length ? materialNames : ["(素材なし)"];}
     create(a){makeObject(name(a.NAME));}
     async setMaterialURL(a){materialBaseURL=normalizeBaseURL(a.URL);await refreshMaterialList();if(runtime.extensionManager&&runtime.extensionManager.refreshBlocks)runtime.extensionManager.refreshBlocks();}
@@ -798,7 +978,7 @@
     setColor(a){const o=object(a.NAME);if(o)setMaterial(o,m=>m.color&&m.color.set(color(a.COLOR)));}
     setOpacity(a){const o=object(a.NAME),opacity=THREE.MathUtils.clamp(1-num(a.VALUE)/100,0,1);if(o)setMaterial(o,m=>{m.transparent=opacity<1;m.opacity=opacity;m.needsUpdate=true;});}
     setPassThrough(a){const o=object(a.NAME);if(o)o.userData.passThrough=name(a.STATE)==="on";}
-    setPhysics(a){const o=object(a.NAME);if(o){o.userData.physics=name(a.STATE)==="on";if(!o.userData.physics)o.userData.velocityY=0;}}
+    setPhysics(a){const o=object(a.NAME);if(o){o.userData.physics=name(a.STATE)==="on";if(!o.userData.physics){o.userData.velocityX=0;o.userData.velocityY=0;o.userData.velocityZ=0;o.userData.angularVelocityX=0;o.userData.angularVelocityY=0;o.userData.angularVelocityZ=0;}}}
     isTouching(a){return Boolean(touching(object(a.NAME),object(a.TARGET)));}
     objectExists(a){return objects.has(name(a.NAME));}
     bounce(a){
@@ -811,7 +991,7 @@
         const centerA=aBox.getCenter(new THREE.Vector3()),centerB=bBox.getCenter(new THREE.Vector3());
         const key=["x","y","z"][axis],direction=centerA[key]>=centerB[key]?1:-1;
         o.position[key]+=direction*(overlaps[axis]+1e-5);
-        if(key==="y")o.userData.velocityY=0;
+        o.userData["velocity"+key.toUpperCase()]=0;
       }
     }
     start(){drawing=true;}
@@ -825,16 +1005,20 @@
     setWorldBrightness(a){worldBrightness=Math.max(0,num(a.VALUE));applySkyEffects();}
     changeWorldBrightness(a){worldBrightness=Math.max(0,worldBrightness+num(a.VALUE));applySkyEffects();}
     setShadows(a){shadowsEnabled=name(a.STATE)==="on";if(shadowsEnabled)updateShadowMap();}
-    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=makeLight(o.userData.lightType||"全体");lights.set(n,l);scene.add(l);}syncLight(o,l);}else{const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}}
-    setLightIntensity(a){const l=lights.get(name(a.NAME));if(l)l.intensity=num(a.VALUE);}
-    setLightColor(a){const l=lights.get(name(a.NAME));if(l)l.color.set(color(a.COLOR));}
+    // [FIX v1.6.8] 一度光源をonにしたあとoffにし、再度onにすると光の強さ/色がデフォルト(10, 白)に
+    // 戻ってしまう不具合を修正。原因は off で lights から light インスタンスごと削除してしまい、
+    // 再度 on にするとき makeLight() に強さ/色を渡していなかったため常に既定値で作り直されていたこと。
+    // → off にする前の強さ/色をオブジェクトの userData に保持しておき、再度 on にするときそれを使う。
+    setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=makeLight(o.userData.lightType||"全体",o.userData.lightIntensity!=null?o.userData.lightIntensity:10,o.userData.lightColor!=null?o.userData.lightColor:0xffffff);lights.set(n,l);scene.add(l);}syncLight(o,l);}else{const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}}
+    setLightIntensity(a){const n=name(a.NAME),o=objects.get(n);const v=num(a.VALUE);if(o)o.userData.lightIntensity=v;const l=lights.get(n);if(l)l.intensity=v;}
+    setLightColor(a){const n=name(a.NAME),o=objects.get(n);const c=color(a.COLOR);if(o)o.userData.lightColor=c;const l=lights.get(n);if(l)l.color.set(c);}
     setLightType(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;const type=name(a.TYPE)==="向いてる方向"?"向いてる方向":"全体";o.userData.lightType=type;const old=lights.get(n);if(old){const next=makeLight(type,old.intensity,old.color);removeLight(old);lights.set(n,next);scene.add(next);syncLight(o,next);}}
-    async setSkyCostume(a,util){const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;if(skyDome){scene.remove(skyDome);disposeObject(skyDome);}skyTexture=texture;skyDome=new THREE.Mesh(new THREE.SphereGeometry(500,60,40),new THREE.MeshBasicMaterial({map:texture,side:THREE.BackSide,fog:false,depthWrite:false}));skyDome.renderOrder=-1;scene.add(skyDome);applySkyEffects();}
+    async setSkyCostume(a,util){const costume=util.target.sprite.costumes.find(c=>c.name===name(a.COSTUME));if(!costume||!costume.asset)return;const texture=await new THREE.TextureLoader().loadAsync(costume.asset.encodeDataURI());texture.colorSpace=THREE.SRGBColorSpace;if(skyDome){scene.remove(skyDome);disposeObject(skyDome);}skyTexture=texture;skyDome=new THREE.Mesh(new THREE.SphereGeometry(500,60,40),new THREE.MeshBasicMaterial({map:texture,side:THREE.BackSide,fog:false,depthWrite:false}));skyDome.renderOrder=-1;scene.add(skyDome);applySkyEffects();refreshReflectiveMaterials();}
     changeSkyColor(a){skyHueEffect=(skyHueEffect+num(a.VALUE))%200;applySkyEffects();}
     changeSkyBrightness(a){skyBrightnessEffect=THREE.MathUtils.clamp(skyBrightnessEffect+num(a.VALUE),-100,100);applySkyEffects();}
     setSkyColorEffect(a){skyHueEffect=num(a.VALUE)%200;applySkyEffects();}
     setSkyBrightnessEffect(a){skyBrightnessEffect=THREE.MathUtils.clamp(num(a.VALUE),-100,100);applySkyEffects();}
-    setReflectivity(a){const o=object(a.NAME),v=THREE.MathUtils.clamp(num(a.VALUE),0,1);if(o)setMaterial(o,m=>{if("metalness" in m)m.metalness=v;if("roughness" in m)m.roughness=1-v;m.needsUpdate=true;});}
+    setReflectivity(a){const o=object(a.NAME),v=THREE.MathUtils.clamp(num(a.VALUE),0,1);if(o)setMaterial(o,m=>{if("metalness" in m)m.metalness=v;if("roughness" in m)m.roughness=1-v;if(v>0){if(!envTexture)regenerateEnvTexture();m.envMap=envTexture;m.envMapIntensity=1;reflectiveMaterials.add(m);}else{m.envMap=null;reflectiveMaterials.delete(m);}m.needsUpdate=true;});}
     getPositionX(a){const o=object(a.NAME);return o?o.position.x:0;}
     getPositionY(a){const o=object(a.NAME);return o?o.position.y:0;}
     getPositionZ(a){const o=object(a.NAME);return o?o.position.z:0;}

@@ -37,7 +37,7 @@
   canvas.addEventListener("webglcontextrestored", () => {
     contextLost = false;
     installBackLayer();
-    refreshReflectiveMaterials(); // [FIX v1.6.12] 反射中のオブジェクトがある場合のみGPUリソースを再生成する
+    refreshReflectiveMaterials(); 
     startRenderLoop();
   }, false);
 
@@ -46,11 +46,6 @@
   camera.position.set(0, 0, 10);
   const ambient = new THREE.AmbientLight(0xffffff, 0.65);
   scene.add(ambient);
-  // [FIX v1.6.11→v1.6.12] 「反射の強さ」を設定した時だけ、そのオブジェクトが環境を映り込むようにする。
-  //   以前の修正でscene.environmentを常時グローバルに設定していたため、反射を一切上げていない
-  //   デフォルトのオブジェクトまでうっすら環境を映り込んでしまっていた。
-  //   → scene.environmentは使わず、setReflectivityで値が0より大きく設定されたマテリアルにだけ
-  //   個別に envMap を割り当てる方式に変更。値を0に戻せばenvMapも外れ、反射しなくなる。
   const pmremGenerator = new THREE.PMREMGenerator(glRenderer);
   pmremGenerator.compileEquirectangularShader();
   let envTexture = null;
@@ -79,7 +74,6 @@
     envScene.add(fillLight);
     return envScene;
   };
-  // 環境マップ本体を(必要なら再)生成するだけで、どのマテリアルにも自動では適用しない。
   const regenerateEnvTexture = () => {
     const prevRT = currentEnvRT;
     if (skyTexture && skyTexture.image) {
@@ -93,8 +87,6 @@
     if (prevRT) prevRT.dispose();
     return envTexture;
   };
-  // 既に反射がonになっている(=envMapを持っている)マテリアルだけに、最新の環境マップを配り直す。
-  //   反射を上げていないオブジェクトのマテリアルはこのSetに入らないため一切影響を受けない。
   const refreshReflectiveMaterials = () => {
     if (reflectiveMaterials.size === 0) return;
     regenerateEnvTexture();
@@ -114,9 +106,6 @@
   let shadowsEnabled = false;
   let shadowUpdateCounter = 0;
   const shadowMapSize = 2048;
-  // [FIX v1.6.6] 深度テクスチャを既定の8bit(UnsignedByteType)から16bit浮動小数点(HalfFloatType)に変更。
-  //   8bitだと深度が256段階にしか量子化されず、壁のような緩やかな傾斜面で「等高線」状の
-  //   段差(=不自然な一直線の影)が出ていた。HalfFloatにすることで滑らかな深度勾配になる。
   const shadowTarget = new THREE.WebGLRenderTarget(shadowMapSize, shadowMapSize, {
     type: THREE.HalfFloatType,
     minFilter: THREE.LinearFilter,
@@ -124,12 +113,6 @@
     generateMipmaps: false,
     depthBuffer: true
   });
-  // [FIX v1.6.9] 影の深度パス(shadowMaterial)がオブジェクトのテクスチャ(alphaTest/map)を
-  //   一切無視していたため、透明にしたい部分まで「完全な不透明の箱」として深度マップに焼き込まれ、
-  //   オブジェクト自身がその誤った深度と衝突してセルフシャドウ判定されてしまい、
-  //   本来テクスチャが透明で背景が見えるはずの面が(減光係数のかかった)黒一色に潰れて見えていた。
-  //   → 深度パスにも uMap(現在描画中メッシュの実テクスチャ)/uAlphaTest を渡し、
-  //   通常描画と同じ条件で discard するようにして、透明部分は深度も書き込まれないようにする。
   const shadowMaterial = new THREE.ShaderMaterial({
     vertexShader: "varying float vDepth;varying vec2 vUv;void main(){vUv=uv;vec4 mv=modelViewMatrix*vec4(position,1.0);vDepth=-mv.z;gl_Position=projectionMatrix*mv;}",
     fragmentShader: "varying float vDepth;varying vec2 vUv;uniform float uNear;uniform float uFar;uniform sampler2D uMap;uniform float uUseMap;uniform float uAlphaTest;void main(){if(uUseMap>0.5){float a=texture2D(uMap,vUv).a;if(a<uAlphaTest)discard;}float d=(vDepth-uNear)/(uFar-uNear);gl_FragColor=vec4(d,d,d,1.0);}",
@@ -139,9 +122,6 @@
   const shadowBiasMatrix = new THREE.Matrix4();
   shadowBiasMatrix.set(0.5, 0.0, 0.0, 0.5, 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0);
   const shadowMatrix = new THREE.Matrix4();
-  // [FIX v1.6.6] 追加uniform: ライト方向・法線バイアス量・シャドウマップ1テクセルのワールドサイズ。
-  //   これらを使ってスロープスケール法線オフセットバイアスを行い、壁のシャドウアクネ(ギザギザの影)と
-  //   ボックス背後の影の浮き/めり込みを両方解消する。
   const shadowUniforms = {
     shadowMap: { value: shadowTarget.texture },
     shadowMatrix: { value: shadowMatrix },
@@ -149,12 +129,6 @@
     shadowLightDir: { value: new THREE.Vector3(0, -1, 0) },
     shadowTexelSize: { value: 0.05 }
   };
-  // [ADD v1.6.12] 「水」機能用の共有アニメーション時計と、水底の疑似コースティクス(光の揺らぎ模様)用uniform。
-  //   waterUniforms.uTime は全ての水オブジェクトの波アニメーションで共有し、常に同期して揺れるようにする。
-  //   causticsUniforms は影(shadow)がonの時だけ、水面より下にあるオブジェクト表面に
-  //   ゆらゆらした光の模様を重ねて「プールの底にいるような」見た目にするために使う。
-  //   影がoffの間はshadowsEnabledがそもそも0なので、この処理は自動的に完全にスキップされる
-  //   (＝影のon/offどちらでも壊れずに動く)。
   const waterUniforms = { uTime: { value: 0 } };
   const causticsUniforms = {
     hasWater: { value: 0.0 },
@@ -205,9 +179,6 @@
   };
   const markTiling = texture => { texture.wrapS=THREE.RepeatWrapping; texture.wrapT=THREE.RepeatWrapping; texture.userData=texture.userData||{}; texture.userData.tile=true; return texture; };
   const updateTilingRepeat = root => {
-    // [FIX v1.6.1] 面ごとにUVを再計算して、画像(100x100)が各面の実寸に合わせてタイルされるようにする。
-    //   Before: texture.repeat を bounding-box の size.x/size.y で一律設定 → 面によって伸縮/縦長化
-    //   After:  BoxGeometry の6面それぞれの UV に面ごとのワールド寸法を baked → 面ごとに正しくタイル
     const texture = root.userData.materialTexture;
     if (!texture || !texture.userData || !texture.userData.tile) return;
     let usedUV = false;
@@ -221,8 +192,6 @@
       const orig = geo.userData._origUV;
       const sx = mesh.scale.x, sy = mesh.scale.y, sz = mesh.scale.z;
       const w = geo.parameters.width || 1, h = geo.parameters.height || 1, d = geo.parameters.depth || 1;
-      // three.js BoxGeometry の面順: +X,-X,+Y,-Y,+Z,-Z (各4頂点)
-      // 各面の (U方向, V方向) のワールドサイズ (画像1枚 = 1ワールド単位 = 100スケール)
       const faces = [
         [sz * d, sy * h], [sz * d, sy * h], // ±X: U=Z(depth), V=Y(height)
         [sx * w, sz * d], [sx * w, sz * d], // ±Y: U=X(width),  V=Z(depth)
@@ -241,10 +210,8 @@
       geo.attributes.uv.needsUpdate = true;
     });
     if (usedUV) {
-      // UVに焼き込んだので repeat は 1:1 に戻す
       texture.repeat.set(1, 1);
     } else {
-      // Box以外(OBJ/GLTF)は従来の repeat 方式をフォールバック
       const size = box(root).getSize(new THREE.Vector3());
       texture.repeat.set(Math.max(0.01, size.x), Math.max(0.01, size.y));
     }
@@ -288,12 +255,6 @@
   const applyPreferredTexture = root => {
     const override = Boolean(root.userData.textureOverride);
     const texture = root.userData.textureOverride || root.userData.materialTexture || null;
-    // [FIX v1.6.7] テクスチャを貼るたびに transparent=true / depthWrite=false にしていたため、
-    // 不透明テクスチャでも深度が書き込まれず、箱の裏側/内側の面が手前の面を突き抜けて
-    // 見える描画崩れ(ソート崩れ)が発生していた。
-    // 通常のブレンディングではなく alphaTest によるカットアウトに切り替えることで、
-    // 不透明テクスチャは正しく深度を書き込みつつ、部分的に透明なテクスチャ(葉っぱ等)も
-    // 引き続き扱えるようにする。
     setMaterial(root, m => {
       m.map = texture;
       m.transparent = false;
@@ -314,33 +275,17 @@
   const _physicsCenterA = new THREE.Vector3();
   const _physicsCenterB = new THREE.Vector3();
   const GRAVITY = -9.8;
-  // [FIX v1.6.11] 「触れたら真上にTP」する不自然な重力を廃止し、自然な落下/バウンド/傾きに変更するための係数
-  const RESTITUTION = 0.35;       // 反発係数(0=跳ねない〜1=完全に跳ね返る)
-  const GROUND_FRICTION = 0.85;   // 着地時に水平方向の速度へかける摩擦(1フレームごと)
-  const ANGULAR_DAMPING = 0.98;   // 回転速度の空気抵抗による減衰(1フレームあたり, 60fps基準)
-  const REST_LINEAR_SPEED = 0.05; // これより遅い速度は静止とみなして0にする(跳ね続ける微振動を防止)
+  const RESTITUTION = 0.35;    
+  const GROUND_FRICTION = 0.85;  
+  const ANGULAR_DAMPING = 0.98;   
+  const REST_LINEAR_SPEED = 0.05; 
   const REST_ANGULAR_SPEED = 0.02;
-  const TUMBLE_FACTOR = 0.6;      // 衝突時、水平速度をどれくらい回転(傾き)に変換するか
-  // [ADD v1.6.14] 真上から垂直に落ちてきただけ(水平速度なし)の場合でも、
-  //   着地点が支えている物の中心からズレている(＝端に乗った/はみ出した)ぶんだけ傾くようにする係数。
-  //   これがないと真下に落ちるだけの物体は永遠に「向き」が変わらなかった。
+  const TUMBLE_FACTOR = 0.6;    
   const TILT_FACTOR = 1.4;
-  // [FIX v1.6.12] 重力の自然化。
-  //   これまでは「着地した瞬間の反発係数の計算」だけに頼っていたため、静止状態でも
-  //   毎フレーム重力→ごく僅かにめり込む→反発、を延々繰り返し、静止しているはずの物体が
-  //   低振幅でずっと小刻みに震え続ける(不自然にプルプルする)問題があった。
-  //   →「着地」を継続的な状態(grounded)として保持し、着地中に発生する速度は
-  //   ほぼ重力1フレーム分の誤差でしかないので、それ未満の衝撃は弾き返さずそのまま吸収して
-  //   完全に静止させる。実際に上から落ちてきた勢いのある衝突(MIN_BOUNCE_SPEED以上)だけが
-  //   跳ね返るようにすることで、「自然に落ちる→跳ねる→徐々に収まって静止する」という
-  //   現実的な重力挙動になる。
-  const MIN_BOUNCE_SPEED = 0.6;   // これ未満の着地速度は跳ね返さず、そのまま吸収して静止させる
-  const MAX_FALL_SPEED = 40;      // 終端速度。高い場所からの落下でも際限なく加速し続けないようにする
-  // [FIX v1.6.12] 「physicsがonのオブジェクトは水に浮く」用の浮力パラメータ。
-  //   沈み込んでいる割合(submergedRatio)に応じて重力を上回る力で押し上げ、
-  //   水中では速度を強めに減衰させることで、水面付近で自然にバランスして浮くようにする。
-  const WATER_BUOYANCY = 1.7;     // 完全に沈んだ時、重力の何倍の力で押し戻すか
-  const WATER_DRAG = 3.2;         // 水中にいる間の速度減衰の強さ
+  const MIN_BOUNCE_SPEED = 0.6;   
+  const MAX_FALL_SPEED = 40;     
+  const WATER_BUOYANCY = 1.7;   
+  const WATER_DRAG = 3.2;       
 
   class CanvasSkin extends renderer.exports.Skin {
     constructor(id) {
@@ -412,11 +357,6 @@
     root.traverse(child => { if (child.isMesh) result.push(child); });
     return result;
   };
-  // [FIX v1.6.14] runtime.extensionManager.refreshBlocks() をブロック実行中(スクリプトのスレッドが
-  //   まだ進行中)に同期的に呼ぶと、TurboWarpのコンパイラがそのスレッドのコンパイル結果を
-  //   即座に無効化してしまい、直後に実行される他のブロック(水にする等)で
-  //   "IR Unknown stacked block" というコンパイルエラーが一時的に出ることがあった。
-  //   実行中のスレッドが完全に抜けた後(次のタスクキュー)で呼び直すことでこれを避ける。
   let refreshBlocksScheduled = false;
   const scheduleRefreshBlocks = () => {
     if (refreshBlocksScheduled) return;
@@ -447,7 +387,6 @@
     mesh.userData.isWater = false;
     mesh.userData.inWater = false;
     mesh.userData.lightType = "全体";
-    // [FIX v1.6.8] 光源offのタイミングで強さ/色を保持しておくための初期値。
     mesh.userData.lightIntensity = 10;
     mesh.userData.lightColor = 0xffffff;
     mesh.userData.materialTexture = null;
@@ -486,8 +425,6 @@
     root.traverse(child => {
       if (child.geometry) child.geometry.dispose();
       if (child.material) (Array.isArray(child.material) ? child.material : [child.material]).forEach(m => { reflectiveMaterials.delete(m); m.dispose(); });
-      // [ADD v1.6.12] setWaterで切り替え保存しておいた「元のマテリアル」/「水用マテリアル」のうち、
-      // 現在使われていない方が捨てられずGPUリソースが残り続けないよう、まとめて破棄する。
       const extras = new Set();
       if (child.userData) {
         if (child.userData.waterMaterial) extras.add(child.userData.waterMaterial);
@@ -615,7 +552,6 @@
     const sz = box.getSize(new THREE.Vector3());
     const ctr = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(sz.x, sz.z, 10);
-    // 光源の位置を取得（最初のライト）。光源があればそこから影を落とす
     let lightPos = null;
     for (const [lightName] of lights) {
       const src = objects.get(lightName);
@@ -647,8 +583,6 @@
     shadowMatrix.multiplyMatrices(shadowMatrix, shadowCamera.matrixWorldInverse);
     shadowMaterial.uniforms.uNear.value = shadowCamera.near;
     shadowMaterial.uniforms.uFar.value = shadowCamera.far;
-    // [FIX v1.6.6] ライトの向き(影を落とす方向)とシャドウマップ1テクセルが表すワールド上の実寸を計算。
-    //   これをシェーダー側のスロープスケールバイアス/PCFサンプリング半径に使う。
     shadowCamera.getWorldDirection(_shadowLightDirTmp);
     shadowUniforms.shadowLightDir.value.copy(_shadowLightDirTmp);
     shadowUniforms.shadowTexelSize.value = (shadowCamera.right - shadowCamera.left) / shadowMapSize;
@@ -668,12 +602,6 @@
     hiddenObjs.forEach(o => o.visible = true);
     if (skyDome) skyDome.visible = skyVis;
   };
-  // [FIX v1.6.9] scene.overrideMaterial は全オブジェクトの描画に同じ shadowMaterial インスタンスを
-  //   使い回すため、メッシュごとに違うテクスチャ/alphaTestを渡す必要がある。
-  //   Object3D.onBeforeRender は各メッシュの描画直前に呼ばれ、その時点で実際に使われる material
-  //   (overrideMaterial適用時はshadowMaterialそのもの)を受け取れるので、それが shadowMaterial の
-  //   場合(=影の深度パス中)だけ、このメッシュ自身の本来のmap/alphaTestを uMap/uAlphaTest に反映する。
-  //   通常のカラーパス(material !== shadowMaterial)では何もしないので、他の描画には影響しない。
   const attachDepthMapSync = mesh => {
     mesh.onBeforeRender = (r, s, c, geometry, material) => {
       if (material !== shadowMaterial) return;
@@ -696,18 +624,10 @@
       shader.uniforms.shadowsEnabled = shadowUniforms.shadowsEnabled;
       shader.uniforms.shadowLightDir = shadowUniforms.shadowLightDir;
       shader.uniforms.shadowTexelSize = shadowUniforms.shadowTexelSize;
-      // [ADD v1.6.12] 水底の疑似コースティクス用uniform(影がonの時だけ使われる)
       shader.uniforms.hasWater = causticsUniforms.hasWater;
       shader.uniforms.waterLevel = causticsUniforms.waterLevel;
       shader.uniforms.causticsTime = causticsUniforms.causticsTime;
-
-      // [FIX v1.6.6] ワールド法線(vWorldNormal)を追加で渡す。
-      //   これが無いと「面が光にほぼ平行(壁など)」な場所でバイアスが一律になり、
-      //   ギザギザのシャドウアクネ(画像内の稲妻状の影)が発生していた。
       shader.vertexShader = "varying vec3 vWorldPos;\nvarying vec3 vWorldNormal;\n" + shader.vertexShader;
-      // 注意: three.jsの標準チャンク順序は #include<beginnormal_vertex> → #include<begin_vertex> の順で、
-      // どちらも void main(){...} の内側にある(#include<common> はmain()の外なので文を置けない)。
-      // 法線チャンクを持たないマテリアル(MeshBasicMaterial等)向けに、無い場合だけbegin_vertex側で既定値を入れる。
       const hasNormalChunk = shader.vertexShader.includes("#include <beginnormal_vertex>");
       shader.vertexShader = shader.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n  vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;" + (hasNormalChunk ? "" : "\n  vWorldNormal = vec3(0.0, 1.0, 0.0);"));
       if (hasNormalChunk) {
@@ -728,11 +648,6 @@
         shader.fragmentShader
       ].join("\n");
 
-      // 16方向のポアソンディスクオフセット。配列コンストラクタ(GLSL ES 3.00以降のみ)や
-      // 動的配列インデックスに依存すると環境によってコンパイルできない/遅いため、
-      // for文を使わず16サンプル分を展開(unroll)して確実に動くようにしている。
-      // フラグメントごとにこの円を回転させることで、固定グリッドPCFで出ていた
-      // 「格子状・一直線状」のアーティファクトを消し、影の濃淡の段階数も実質連続に近づける。
       const poissonDisk = [
         [-0.94201624, -0.39906216], [0.94558609, -0.76890725],
         [-0.09418410, -0.92938870], [0.34495938, 0.29387760],
@@ -751,9 +666,6 @@
         "#include <color_fragment>",
         "  if (shadowsEnabled > 0.5) {",
         "    vec3 sNormal = normalize(vWorldNormal);",
-        // ライトに正対しているほどバイアスを小さく、かすめる角度(壁など)ほど大きくする
-        // スロープスケールバイアス。固定バイアスだけだと、正対面では浮き影(ボックス背後の不自然な隙間)、
-        // かすめ面ではアクネ(画像内の壁の稲妻状の影)のどちらかしか解消できなかった。
         "    float sNdotL = clamp(dot(sNormal, -normalize(shadowLightDir)), 0.0, 1.0);",
         "    float sSlope = clamp(1.0 - sNdotL, 0.0, 1.0);",
         "    float sNormalBias = shadowTexelSize * (1.0 + sSlope * 6.0);",
@@ -762,33 +674,16 @@
         "    vec4 sCoord = shadowMatrix * vec4(sOffsetPos, 1.0);",
         "    sCoord.xyz /= sCoord.w;",
         "    if (sCoord.x >= 0.0 && sCoord.x <= 1.0 && sCoord.y >= 0.0 && sCoord.y <= 1.0 && sCoord.z >= 0.0 && sCoord.z <= 1.0) {",
-        // フラグメント位置から疑似乱数角度を作り、サンプル円を回転(=ディザリング)。バンディングや
-        // 目に見える一直線パターンを消し、なだらかな半影(ペナンブラ)にする。
         "      float sAngle = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.28318530718;",
         "      float sCa = cos(sAngle), sSa = sin(sAngle);",
         "      mat2 sRot = mat2(sCa, -sSa, sSa, sCa);",
-        // [FIX v1.6.8] shadowTexelSize はワールド空間の1テクセルの実寸(バイアス計算用)だが、
-        // ここでの sOff は shadowMap の「UV空間(0〜1)」上のオフセットとして sCoord.xy に加算される。
-        // 単位が違う値をそのまま使っていたため、シーン全体(全オブジェクト)のバウンディングボックスから
-        // 求めた frust が大きいシーンほど shadowTexelSize(ワールド単位)が大きくなり、
-        // UVオフセットとして解釈すると数百px規模のとても広い範囲をサンプリングしてしまっていた。
-        // 大きな低ポリオブジェクト(壁など)は影の範囲が広いため誤差が目立たないが、
-        // 小さく丸みのある(面が多い＝滑らかな曲面の)オブジェクトは影の範囲がその誤ったサンプル半径より
-        // 小さいため、無関係な(影になっていない)テクセルばかり平均されて影がほぼ消えてしまっていた。
-        // → shadowMap解像度(shadowMapSize)を基準にした「UV空間の1テクセル分」を使うよう修正。
         `      float sRadius = (1.0 / ${shadowMapSize.toFixed(1)}) * 3.0;`,
         "      float shadow = 0.0;",
-        // 二値比較ではなくsmoothstepで各サンプルを連続値化 → 影の濃淡段階が16サンプル×連続値でなめらかに
         sampleLines,
         "      shadow /= 16.0;",
         "      diffuseColor.rgb *= 1.0 - shadow * 0.65;",
         "    }",
         "  }",
-        // [ADD v1.6.12] 水底のコースティクス(水面のゆらぎで光が集まってできる網目模様)の簡易再現。
-        //   影(shadowsEnabled)がonで、かつシーンに「水」オブジェクトが1つ以上ある時だけ、
-        //   水面より下にある面(プールの床・壁・沈んでいる物体の下側など)にゆらゆら動く
-        //   明暗パターンを重ねる。影がoffの時やwaterが1つも無い時はhasWater/shadowsEnabledが
-        //   0のままなので、このブロックは実質何もせず、両方の状態で安全に動作する。
         "  if (shadowsEnabled > 0.5 && hasWater > 0.5 && vWorldPos.y < waterLevel) {",
         "    vec2 cp = vWorldPos.xz * 0.35;",
         "    float ct = causticsTime;",
@@ -803,14 +698,6 @@
     };
     material.needsUpdate = true;
   };
-
-  // [ADD v1.6.12] 「水」機能。
-  //   ・頂点シェーダーで複数のサイン波を重ねてゆらゆら波打つ水面にする
-  //   ・フラグメントシェーダーでスクリーンショットのような流れる網目(ワイヤーフレーム風)の
-  //     模様と、波の高いところがうっすら明るくなる簡易的な泡/ハイライトを付ける
-  //   ・任意でユーザーが設定したテクスチャ(リスト or URL)を波の上にブレンドできる
-  //   ・patchShadowShader を必ずかけているので、影のon/offどちらでも(影の有無に関わらず)
-  //     水自体は常に正しく描画され、影をonにした時だけ水底コースティクスと連動する
   const installWaterShader = material => {
     const uTime = waterUniforms.uTime;
     const uTex = { value: WATER_DUMMY_TEXTURE };
@@ -825,8 +712,6 @@
       shader.vertexShader = "uniform float uWaterTime;\nvarying vec2 vWaterUv;\nvarying float vWaterHeight;\n" + shader.vertexShader;
       shader.vertexShader = shader.vertexShader.replace("#include <project_vertex>", [
         "  vWaterUv = uv;",
-        // 複数の異なる周波数/速度/向きのサイン波を重ねることで、単調な繰り返しに見えない
-        // 自然な「うねり」を作る(スクリーンショットのような複雑に流れる波紋に近づける)
         "  float _wx = transformed.x, _wz = transformed.z, _wt = uWaterTime;",
         "  float _wh = sin(_wx * 1.3 + _wt * 1.1) * 0.05",
         "    + sin(_wz * 1.7 - _wt * 0.9) * 0.045",
@@ -841,15 +726,12 @@
       shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", [
         "#include <color_fragment>",
         "  {",
-        // 時間とともに流れる格子状のライン模様。fractによる格子の最寄りの線までの距離を
-        // smoothstepで滑らかにすることで、画像のような細い流れる網目模様になる
         "    vec2 _guv = vWaterUv * 12.0 + vec2(uWaterTime * 0.06, uWaterTime * 0.045);",
         "    _guv += vec2(sin(uWaterTime * 0.5 + vWaterUv.y * 6.0), cos(uWaterTime * 0.4 + vWaterUv.x * 6.0)) * 0.15;",
         "    float _gl = min(abs(fract(_guv.x) - 0.5), abs(fract(_guv.y) - 0.5));",
         "    float _grid = smoothstep(0.0, 0.06, _gl);",
         "    diffuseColor.rgb *= mix(0.72, 1.0, _grid);",
         "    diffuseColor.rgb += vec3(0.5, 0.95, 1.0) * (1.0 - _grid) * 0.10;",
-        // 波の高いところ(波頭)をうっすら明るく(簡易的な泡/ハイライト表現)
         "    diffuseColor.rgb += vec3(1.0) * clamp(vWaterHeight * 5.0, 0.0, 1.0) * 0.18;",
         "    if (uWaterUseTex > 0.5) {",
         "      vec2 _tuv = vWaterUv * 2.0 + vec2(uWaterTime * 0.02, uWaterTime * 0.014);",
@@ -874,8 +756,6 @@
     installWaterShader(m);
     return m;
   };
-  // 波が滑らかに見えるよう、まだ低分割のBoxGeometryのままなら分割数を増やしたものに差し替える
-  // (OBJ/GLTFなど既にカスタムなジオメトリを持つオブジェクトは触らない)
   const ensureWaterGeometry = mesh => {
     const geo = mesh.geometry;
     if (!geo || geo.type !== "BoxGeometry" || (geo.userData && geo.userData.waterSubdivided)) return;
@@ -897,8 +777,6 @@
           if (src && src.color) wm.color.copy(src.color);
           mesh.userData.waterMaterial = wm;
         }
-        // [FIX v1.6.14] 水にするとオブジェクトの透明度が(水用マテリアルの既定値0.82に)
-        //   勝手に変わってしまっていたのを修正。元のマテリアルの透明度をそのまま引き継ぐ。
         if (src) {
           mesh.userData.waterMaterial.opacity = src.opacity;
           mesh.userData.waterMaterial.transparent = src.transparent;
@@ -929,15 +807,7 @@
     for (const moving of objects.values()) {
       if (!moving.userData.physics) continue;
       const u = moving.userData;
-
-      // --- 自由落下(重力はYのみに作用するが、X/Zの速度があればそちらにも動く) ---
-      // [FIX v1.6.12] 接地(grounded)中は「1フレーム分の重力による誤差」だけを許容し、
-      //   それを超える速度が生まれた場合のみ本当に落下し始めたとみなす。
-      //   これにより静止しているはずの物体が毎フレーム僅かに沈んでは跳ね返る、を
-      //   永遠に繰り返す不自然な微振動(プルプル)がなくなる。
       u.velocityY = Math.max((u.velocityY || 0) + GRAVITY * delta, -MAX_FALL_SPEED);
-
-      // --- 浮力: physicsがonのオブジェクトが「水」オブジェクトに沈んでいる分だけ上向きに力を加える ---
       let inWater = false;
       for (const water of objects.values()) {
         if (water === moving || !water.userData.isWater) continue;
@@ -949,8 +819,6 @@
         const submergedRatio = THREE.MathUtils.clamp(submerged / objHeight, 0, 1);
         if (submergedRatio <= 0) continue;
         inWater = true;
-        // アルキメデスの原理の簡易再現: 沈んだ割合が大きいほど強く押し上げ、
-        // 水の抵抗(ドラッグ)で速度を素早く減衰させることで水面付近で自然に浮かんで安定する
         u.velocityY += -GRAVITY * WATER_BUOYANCY * submergedRatio * delta;
         const drag = Math.pow(1 / (1 + WATER_DRAG * submergedRatio * delta), 1);
         u.velocityY *= drag;
@@ -964,7 +832,6 @@
       moving.position.y += u.velocityY * delta;
       moving.position.z += (u.velocityZ || 0) * delta;
 
-      // --- 角速度による自然な傾き/転がり(見た目の演出。空気抵抗で徐々に収まる) ---
       const avx = u.angularVelocityX || 0, avy = u.angularVelocityY || 0, avz = u.angularVelocityZ || 0;
       if (avx || avy || avz) {
         if (avx) { _deltaQuat.setFromAxisAngle(_localAxisX, avx * delta); moving.quaternion.premultiply(_deltaQuat); }
@@ -982,15 +849,9 @@
       let movingBox = box(moving);
       let groundedThisFrame = false;
       for (const other of objects.values()) {
-        // [FIX v1.6.12] 「水」は固い床としては扱わない(浮力だけで浮かせるので、
-        //   ここで押し出してしまうと水面に瞬間的に弾かれる不自然な挙動になる)
         if (other === moving || other.userData.passThrough || other.userData.isWater) continue;
         const otherBox = box(other);
         if (!movingBox.intersectsBox(otherBox)) continue;
-
-        // [FIX v1.6.11] 「触れた瞬間に相手の真上へワープする」不自然な重力を廃止。
-        // 3軸それぞれのめり込み量(overlap)を比較し、最も浅い軸を衝突面とみなす標準的なMTV法で
-        // "めり込んだ分だけ" 押し戻す(＝ワープではなく実際に接触した位置に留める)。
         const overlapX = Math.min(movingBox.max.x - otherBox.min.x, otherBox.max.x - movingBox.min.x);
         const overlapY = Math.min(movingBox.max.y - otherBox.min.y, otherBox.max.y - movingBox.min.y);
         const overlapZ = Math.min(movingBox.max.z - otherBox.min.z, otherBox.max.z - movingBox.min.z);
@@ -1003,17 +864,13 @@
         const otherCenter = otherBox.getCenter(_physicsCenterB);
         const direction = movingCenter[key] >= otherCenter[key] ? 1 : -1;
 
-        // めり込んだ分だけ押し戻す(実測のめり込み量ぶんの最小移動。相手の上面へのワープはしない)
         moving.position[key] += direction * (overlaps[axis] + 1e-5);
 
         const velKey = "velocity" + key.toUpperCase();
         const v = u[velKey] || 0;
-        // 衝突面へ向かっていた速度成分だけを反発させる(既に離れる向きに動いていれば何もしない)
         if (v * direction < 0) {
           const impactSpeed = Math.abs(v);
           if (key === "y" && direction > 0 && impactSpeed < MIN_BOUNCE_SPEED) {
-            // [FIX v1.6.12] ほぼ静止状態からの着地(=1フレーム分の重力による誤差程度)は
-            //   跳ね返さずそのまま吸収して完全に静止させる。これで永遠に続く微振動を防ぐ。
             u[velKey] = 0;
             groundedThisFrame = true;
           } else {
@@ -1021,13 +878,10 @@
             u[velKey] = Math.abs(bounced) < REST_LINEAR_SPEED ? 0 : bounced;
 
             if (key === "y" && direction > 0) {
-              // 物の上に着地したケース: 摩擦で水平速度を減衰させ、その勢いを回転(傾き)に変換する
               u.velocityX = (u.velocityX || 0) * GROUND_FRICTION;
               u.velocityZ = (u.velocityZ || 0) * GROUND_FRICTION;
               u.angularVelocityZ = (u.angularVelocityZ || 0) - u.velocityX * TUMBLE_FACTOR;
               u.angularVelocityX = (u.angularVelocityX || 0) + u.velocityZ * TUMBLE_FACTOR;
-              // [ADD v1.6.14] 水平速度が0(真下に落ちただけ)でも、着地点が支えの中心からズレていれば
-              //   その分だけ傾ける(重心が支持面からはみ出すほど大きく傾く簡易的な表現)
               const supportHalfX = Math.max((otherBox.max.x - otherBox.min.x) / 2, 1e-4);
               const supportHalfZ = Math.max((otherBox.max.z - otherBox.min.z) / 2, 1e-4);
               const overhangX = THREE.MathUtils.clamp((movingCenter.x - otherCenter.x) / supportHalfX, -1, 1);
@@ -1036,12 +890,10 @@
               u.angularVelocityX += overhangZ * TILT_FACTOR * Math.min(impactSpeed, 1);
               if (Math.abs(u[velKey]) < REST_LINEAR_SPEED) groundedThisFrame = true;
             } else if (key !== "y") {
-              // 側面(壁や他のオブジェクトの横)にぶつかったケース: 少し傾ける演出
               u.angularVelocityY = (u.angularVelocityY || 0) + v * TUMBLE_FACTOR * 0.5;
             }
           }
         } else if (key === "y" && direction > 0 && Math.abs(v) < MIN_BOUNCE_SPEED) {
-          // 既にほぼ静止した状態で接地面に触れ続けている(=乗っている)ケース
           groundedThisFrame = true;
         }
         movingBox = box(moving);
@@ -1064,8 +916,6 @@
     const delta = Math.min(_physicsClock.getDelta(), 0.05);
     updatePhysics(delta);
     waterUniforms.uTime.value += delta;
-    // [ADD v1.6.12] シーンに「水」オブジェクトがあるかどうかと、その水面の高さ(一番高いものを採用)を
-    // 毎フレーム更新しておく。これは影(shadow)がonの時の水底コースティクス表現でのみ参照される。
     let anyWater = false, waterTopY = -100000;
     for (const o of objects.values()) {
       if (!o.userData.isWater) continue;
@@ -1224,13 +1074,9 @@
     setRotationX(a){const o=object(a.NAME);if(o)o.rotation.x=THREE.MathUtils.degToRad(num(a.VALUE));}
     setRotationY(a){const o=object(a.NAME);if(o)o.rotation.y=THREE.MathUtils.degToRad(num(a.VALUE));}
     setRotationZ(a){const o=object(a.NAME);if(o)o.rotation.z=THREE.MathUtils.degToRad(num(a.VALUE));}
-    // [FIX v1.2.1] ローカル軸回転: オブジェクトの向き基準で回転する
-    //   Before: o.rotation.x += deg (ワールド軸の Euler 回転 → オブジェクトが向いてる方向と無関係)
-    //   After:  quaternion.multiply(deltaQuat on local axis) → オブジェクトのローカル軸で回転
     changeRotationX(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisX,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
     changeRotationY(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisY,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
     changeRotationZ(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisZ,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.multiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
-    // ワールド軸回転（オブジェクト自身の向きに影響されない）
     changeRotationXWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisX,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
     changeRotationYWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisY,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
     changeRotationZWorld(a){const o=object(a.NAME);if(o){_deltaQuat.setFromAxisAngle(_localAxisZ,THREE.MathUtils.degToRad(num(a.VALUE)));o.quaternion.premultiply(_deltaQuat);o.rotation.setFromQuaternion(o.quaternion);}}
@@ -1280,10 +1126,6 @@
     setWorldBrightness(a){worldBrightness=Math.max(0,num(a.VALUE));applySkyEffects();}
     changeWorldBrightness(a){worldBrightness=Math.max(0,worldBrightness+num(a.VALUE));applySkyEffects();}
     setShadows(a){shadowsEnabled=name(a.STATE)==="on";if(shadowsEnabled)updateShadowMap();}
-    // [FIX v1.6.8] 一度光源をonにしたあとoffにし、再度onにすると光の強さ/色がデフォルト(10, 白)に
-    // 戻ってしまう不具合を修正。原因は off で lights から light インスタンスごと削除してしまい、
-    // 再度 on にするとき makeLight() に強さ/色を渡していなかったため常に既定値で作り直されていたこと。
-    // → off にする前の強さ/色をオブジェクトの userData に保持しておき、再度 on にするときそれを使う。
     setLight(a){const n=name(a.NAME),o=objects.get(n);if(!o)return;if(name(a.STATE)==="on"){let l=lights.get(n);if(!l){l=makeLight(o.userData.lightType||"全体",o.userData.lightIntensity!=null?o.userData.lightIntensity:10,o.userData.lightColor!=null?o.userData.lightColor:0xffffff);lights.set(n,l);scene.add(l);}syncLight(o,l);}else{const l=lights.get(n);if(l){removeLight(l);lights.delete(n);}}}
     setLightIntensity(a){const n=name(a.NAME),o=objects.get(n);const v=num(a.VALUE);if(o)o.userData.lightIntensity=v;const l=lights.get(n);if(l)l.intensity=v;}
     setLightColor(a){const n=name(a.NAME),o=objects.get(n);const c=color(a.COLOR);if(o)o.userData.lightColor=c;const l=lights.get(n);if(l)l.color.set(c);}

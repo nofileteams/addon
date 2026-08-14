@@ -8,6 +8,16 @@
   const DEFAULT_MODEL = "llama-3.3-70b-versatile";
   const DEFAULT_MAX_HISTORY = 20;
 
+  // 選択メニューに出すおすすめモデル一覧(必要に応じて増減してOK)
+  const MODEL_LIST = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+  ];
+
   class GroqAIExtension {
     constructor() {
       this.apiKey = "";
@@ -15,6 +25,7 @@
       this.history = []; // [{role: "user" | "assistant", content: "..."}]
       this.autoClear = true;
       this.maxHistory = DEFAULT_MAX_HISTORY;
+      this.model = DEFAULT_MODEL;
     }
 
     getInfo() {
@@ -45,6 +56,34 @@
                 defaultValue: "あなたは親切なアシスタントです。",
               },
             },
+          },
+          {
+            opcode: "setModel",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "使用するモデルを [MODEL] にする",
+            arguments: {
+              MODEL: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "modelMenu",
+                defaultValue: DEFAULT_MODEL,
+              },
+            },
+          },
+          {
+            opcode: "setCustomModel",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "使用するモデルを自由入力で [MODEL] にする",
+            arguments: {
+              MODEL: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: DEFAULT_MODEL,
+              },
+            },
+          },
+          {
+            opcode: "getModel",
+            blockType: Scratch.BlockType.REPORTER,
+            text: "現在のモデル",
           },
           "---",
           {
@@ -114,6 +153,10 @@
             acceptReporters: true,
             items: ["on", "off"],
           },
+          modelMenu: {
+            acceptReporters: true,
+            items: MODEL_LIST,
+          },
         },
       };
     }
@@ -126,6 +169,20 @@
 
     setCustomInstructions(args) {
       this.customInstructions = String(args.TEXT);
+    }
+
+    setModel(args) {
+      const m = String(args.MODEL).trim();
+      this.model = m || DEFAULT_MODEL;
+    }
+
+    setCustomModel(args) {
+      const m = String(args.MODEL).trim();
+      this.model = m || DEFAULT_MODEL;
+    }
+
+    getModel() {
+      return this.model;
     }
 
     // ---- 履歴管理ブロック ----
@@ -180,7 +237,7 @@
               Authorization: `Bearer ${this.apiKey}`,
             },
             body: JSON.stringify({
-              model: DEFAULT_MODEL,
+              model: this.model,
               messages,
             }),
           }

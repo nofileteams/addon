@@ -5,17 +5,17 @@
     throw new Error("この拡張機能はサンドボックス化されていない状態(unsandboxed)で実行する必要があります");
   }
 
-  const DEFAULT_MODEL = "llama-3.3-70b-versatile";
+  const DEFAULT_MODEL = "openai/gpt-oss-120b";
   const DEFAULT_MAX_HISTORY = 20;
 
-  // 選択メニューに出すおすすめモデル一覧(必要に応じて増減してOK)
+  // 選択メニューに出すおすすめモデル一覧(2026年6月のGroq側モデル廃止に伴い更新。必要に応じて増減してOK)
   const MODEL_LIST = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
+    "moonshotai/kimi-k2-instruct-0905",
+    "compound-beta",
+    "compound-beta-mini",
   ];
 
   class GroqAIExtension {
